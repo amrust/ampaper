@@ -172,6 +172,29 @@ impl Block {
     pub fn verify_crc(&self) -> bool {
         self.compute_crc() == self.crc
     }
+
+    /// Compute the Reed-Solomon parity for this block's (addr, data,
+    /// crc) — the first 96 bytes of the wire form. The encoder
+    /// pipeline writes parity via `block.ecc = block.compute_ecc()`
+    /// after the CRC is set; see FORMAT-V1.md §2.3 and `Printer.cpp:176`.
+    #[must_use]
+    pub fn compute_ecc(&self) -> [u8; ECC_BYTES] {
+        crate::ecc::encode_parity(&self.to_bytes()[..crate::ecc::MESSAGE_BYTES])
+    }
+
+    /// Returns true when [`Self::ecc`] matches the parity that would
+    /// be computed from this block's first 96 bytes — i.e. the block
+    /// is intact with respect to RS parity.
+    ///
+    /// Note this is a sanity check, not a recovery mechanism. A block
+    /// with up to 16 byte errors fails this check yet is still
+    /// recoverable via [`crate::ecc::decode8`]. Use this method after
+    /// the decoder pipeline has already corrected (or confirmed
+    /// unmodified) the wire bytes.
+    #[must_use]
+    pub fn verify_ecc(&self) -> bool {
+        self.compute_ecc() == self.ecc
+    }
 }
 
 // --- SuperBlock --------------------------------------------------------------
@@ -274,6 +297,22 @@ impl SuperBlock {
     #[must_use]
     pub fn verify_crc(&self) -> bool {
         self.compute_crc() == self.crc
+    }
+
+    /// Same convention as [`Block::compute_ecc`]: Reed-Solomon parity
+    /// over the first 96 bytes of the wire form. Block and SuperBlock
+    /// are RS-equivalent on the wire — both consume one (128, 96)
+    /// codeword's worth of space.
+    #[must_use]
+    pub fn compute_ecc(&self) -> [u8; ECC_BYTES] {
+        crate::ecc::encode_parity(&self.to_bytes()[..crate::ecc::MESSAGE_BYTES])
+    }
+
+    /// Returns true when [`Self::ecc`] matches the parity that would
+    /// be computed from this superblock's first 96 bytes.
+    #[must_use]
+    pub fn verify_ecc(&self) -> bool {
+        self.compute_ecc() == self.ecc
     }
 }
 
@@ -550,6 +589,116 @@ mod tests {
         assert!(s.verify_crc());
         s.page = 2;
         assert!(!s.verify_crc());
+    }
+
+    /// Block whose ecc field is set via compute_ecc must verify_ecc,
+    /// and the resulting wire bytes must round-trip through the RS
+    /// decoder with zero corrections.
+    #[test]
+    fn block_ecc_round_trips_through_decoder() {
+        let mut b = Block {
+            addr: 90 * 12,
+            data: core::array::from_fn(|i| (i as u8).wrapping_mul(17)),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        b.ecc = b.compute_ecc();
+        assert!(b.verify_crc());
+        assert!(b.verify_ecc());
+
+        let original_bytes = b.to_bytes();
+        let mut wire = original_bytes;
+        let n = crate::ecc::decode8(&mut wire).unwrap();
+        assert_eq!(n, 0, "valid block should need 0 corrections");
+        assert_eq!(wire, original_bytes, "valid block must not change");
+
+        // Re-parse and re-verify: the round-trip is invariant.
+        let parsed = Block::from_bytes(&wire);
+        assert_eq!(parsed, b);
+        assert!(parsed.verify_crc());
+        assert!(parsed.verify_ecc());
+    }
+
+    /// Single-byte error injected into the data region of the wire
+    /// form is corrected by RS, and the recovered block matches the
+    /// original byte-for-byte. Validates the encoder/decoder/Block
+    /// pipeline end-to-end.
+    #[test]
+    fn block_recovers_from_single_byte_error() {
+        let mut b = Block {
+            addr: SUPERBLOCK_ADDR ^ 1, // arbitrary non-special addr
+            data: core::array::from_fn(|i| 0xC3 ^ (i as u8)),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        b.ecc = b.compute_ecc();
+
+        let original_bytes = b.to_bytes();
+        let mut wire = original_bytes;
+        wire[42] ^= 0xA5; // flip a byte inside the data region
+        assert_ne!(wire, original_bytes);
+
+        let n = crate::ecc::decode8(&mut wire).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(wire, original_bytes);
+    }
+
+    /// SuperBlock RS parity round-trips the same as Block. Both are
+    /// (128, 96) codewords on the wire; the only structural difference
+    /// is the field discriminator.
+    #[test]
+    fn super_block_ecc_round_trips_through_decoder() {
+        let mut s = SuperBlock {
+            datasize: 1024,
+            pagesize: 512,
+            origsize: 2048,
+            mode: PBM_COMPRESSED,
+            attributes: 0x20,
+            page: 1,
+            modified: 0x01D5_C0FF_EE12_3456,
+            filecrc: 0x1234,
+            name: core::array::from_fn(|i| (i as u8).wrapping_add(b'a')),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        s.crc = s.compute_crc();
+        s.ecc = s.compute_ecc();
+        assert!(s.verify_crc());
+        assert!(s.verify_ecc());
+
+        let original_bytes = s.to_bytes();
+        let mut wire = original_bytes;
+        let n = crate::ecc::decode8(&mut wire).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(wire, original_bytes);
+
+        let parsed = SuperBlock::from_bytes(&wire).unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    /// verify_ecc is a sanity check, not a recovery mechanism: a
+    /// single bit flip in the data field invalidates ecc even though
+    /// the block is recoverable via the full decoder. Pins the
+    /// distinction between "intact" and "recoverable" so the doc
+    /// comment doesn't drift away from behavior.
+    #[test]
+    fn verify_ecc_rejects_correctable_error() {
+        let mut b = Block {
+            addr: 0,
+            data: [0x77; NDATA],
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        b.ecc = b.compute_ecc();
+        assert!(b.verify_ecc());
+        b.data[10] ^= 1;
+        assert!(
+            !b.verify_ecc(),
+            "corrupted block must fail verify_ecc even though recoverable"
+        );
     }
 
     /// Field offsets must match FORMAT-V1.md §3 byte by byte. If any
