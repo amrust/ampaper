@@ -498,4 +498,111 @@ mod tests {
         codeword[MESSAGE_BYTES..].copy_from_slice(&parity);
         codeword
     }
+
+    // ---- Cross-source vectors against PaperBack 1.10's Ecc.cpp -------------
+    //
+    // Captured by compiling PaperBack 1.10's Encode8 / Decode8 stand-alone
+    // and emitting parity for three deterministic inputs. The build harness
+    // lives at reference/helpers/ecc_vectors.c (gitignored under /reference/);
+    // re-run it after any change that could affect encoder output:
+    //
+    //   cd reference/helpers
+    //   cl /nologo /O2 /TP ecc_vectors.c ../paperbak-1.10.src/Ecc.cpp /Fe:ecc_vectors.exe
+    //   ./ecc_vectors.exe
+    //
+    // Two assertions per vector:
+    //   1. Our encoder produces the same parity bytes as the C encoder
+    //      (catches encoder drift against the spec).
+    //   2. Our decoder, given the C-emitted codeword, returns 0 corrections
+    //      and leaves the codeword unchanged (catches decoder drift).
+    //
+    // Together these are level-3 of the three-way cross-check from
+    // feedback_three_way_crosscheck.md memory: the third party (PaperBack
+    // 1.10's own C source) decoded ampaper's "legacy mode" output equivalent.
+
+    /// Pure ramp 0..96. Lowest-entropy non-trivial input.
+    const VECTOR_RAMP_PARITY: [u8; PARITY_BYTES] = [
+        0xAC, 0xEF, 0x22, 0x7E, 0x64, 0x50, 0x76, 0x60, 0x6F, 0x2A, 0xD3, 0xAA, 0xDF, 0x88, 0xF7,
+        0x08, 0xAA, 0x9D, 0x69, 0x9D, 0x56, 0xB5, 0x37, 0xE3, 0xB1, 0x1D, 0x77, 0x4F, 0x55, 0x61,
+        0x77, 0x8A,
+    ];
+
+    /// LCG-style pattern: i * 37 + 5 mod 256. Higher-entropy than the ramp.
+    const VECTOR_LCG_PARITY: [u8; PARITY_BYTES] = [
+        0x05, 0xCF, 0xF8, 0x7B, 0x9E, 0xD4, 0xA1, 0xA6, 0x08, 0x6C, 0xEE, 0xA3, 0x50, 0x48, 0x47,
+        0x84, 0xDD, 0x28, 0x47, 0x38, 0x04, 0x0A, 0xE4, 0x89, 0xB7, 0x59, 0xAA, 0xD9, 0x7F, 0xCC,
+        0xDB, 0xFB,
+    ];
+
+    /// Block-shaped: addr = LE(0x0000_5A00), data = 0xC3 ^ index, crc = 0x55AA.
+    /// Mirrors the byte layout of a real Block::to_bytes()[..96] for a data
+    /// block at offset 0x5A00, so this vector also exercises the bytes the
+    /// encoder will see in practice.
+    const VECTOR_BLOCK_PARITY: [u8; PARITY_BYTES] = [
+        0x4C, 0xC1, 0x09, 0x3C, 0x64, 0xC8, 0xFE, 0x6C, 0xA5, 0x6E, 0x9A, 0xAC, 0x93, 0x68, 0xFD,
+        0x19, 0x7B, 0x52, 0xAA, 0x56, 0x2F, 0xB2, 0xB2, 0xF7, 0x90, 0xD7, 0xE5, 0xE5, 0xA2, 0x45,
+        0x06, 0x20,
+    ];
+
+    fn check_vector(message: &[u8; MESSAGE_BYTES], expected_parity: &[u8; PARITY_BYTES]) {
+        // Encoder must match the C source byte for byte.
+        let parity = encode_parity(message);
+        assert_eq!(
+            &parity, expected_parity,
+            "Rust parity diverged from C parity"
+        );
+
+        // Decoder must accept the C-emitted codeword with zero corrections.
+        let mut codeword = [0u8; CODEWORD_BYTES];
+        codeword[..MESSAGE_BYTES].copy_from_slice(message);
+        codeword[MESSAGE_BYTES..].copy_from_slice(expected_parity);
+        let original = codeword;
+        let n = decode8(&mut codeword).expect("decoder rejected valid C-emitted codeword");
+        assert_eq!(
+            n, 0,
+            "decoder reported non-zero corrections on valid codeword"
+        );
+        assert_eq!(codeword, original, "decoder mutated a valid codeword");
+    }
+
+    #[test]
+    fn matches_paperbak_c_source_ramp_vector() {
+        let mut msg = [0u8; MESSAGE_BYTES];
+        for (i, b) in msg.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        check_vector(&msg, &VECTOR_RAMP_PARITY);
+    }
+
+    #[test]
+    fn matches_paperbak_c_source_lcg_vector() {
+        let mut msg = [0u8; MESSAGE_BYTES];
+        for (i, b) in msg.iter_mut().enumerate() {
+            *b = (i as u32 * 37 + 5) as u8;
+        }
+        check_vector(&msg, &VECTOR_LCG_PARITY);
+    }
+
+    #[test]
+    fn matches_paperbak_c_source_block_shaped_vector() {
+        let mut msg = [0u8; MESSAGE_BYTES];
+        // addr = 0x0000_5A00 (LE)
+        msg[0] = 0x00;
+        msg[1] = 0x5A;
+        msg[2] = 0x00;
+        msg[3] = 0x00;
+        // data[0..90] = 0xC3 ^ index
+        for i in 0..NDATA_TEST {
+            msg[4 + i] = 0xC3 ^ (i as u8);
+        }
+        // crc bytes 94..96 = LE 0x55AA
+        msg[94] = 0xAA;
+        msg[95] = 0x55;
+        check_vector(&msg, &VECTOR_BLOCK_PARITY);
+    }
+
+    /// Local copy of NDATA so this module doesn't have to reach into block.
+    /// 90 bytes of data per block — comes from FORMAT-V1.md / paperbak.h:51.
+    const NDATA_TEST: usize = 90;
+    const _: () = assert!(4 + NDATA_TEST + 2 == MESSAGE_BYTES);
 }
