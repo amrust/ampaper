@@ -1,0 +1,45 @@
+ampaper
+=============
+
+This project is a Rust port of PaperBack, originally written in
+Borland C++ by Oleh Yuschuk (ollydbg).
+
+Original project:
+  Name:    PaperBack
+  Author:  Oleh Yuschuk
+  Source:  https://www.ollydbg.de/Paperbak/
+  License: GNU General Public License v3.0 (or later)
+  Copyright (C) 2007-2013 Oleh Yuschuk
+
+Modern C++ rewrite (read-only reference for ampaper):
+  Name:    MRPODS (Machine Readable Printable Optical Data Sheets)
+  Source:  https://github.com/sheafdynamics/mrpods
+  License: GNU General Public License v3.0 (or later)
+
+This port:
+  Name:    ampaper
+  Source:  https://github.com/amrust/ampaper
+  License: GNU General Public License v3.0 (or later)
+
+As a derivative work of PaperBack, ampaper is distributed under
+the same license (GPL-3.0-or-later) as required by section 5 of
+the GPL. The full license text is in the LICENSE file.
+
+ampaper is an independent re-implementation. It is not affiliated
+with, endorsed by, or sponsored by Oleh Yuschuk, the original
+PaperBack project, or the MRPODS project.
+
+----
+
+Format compatibility
+--------------------
+
+ampaper aims for byte-exact compatibility with PaperBack 1.10
+output: scans of pages produced by PaperBack 1.10 must decode
+in ampaper, and ampaper's "legacy" output must decode in
+PaperBack 1.10. This is the binary ground-truth check that
+proves the rewrite is correct.
+
+Forward features (improved encoders, AES-256, color schemes,
+etc.) live behind explicit "ampaper format v2" mode flags so
+they don't compromise legacy compatibility.

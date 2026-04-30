@@ -1,0 +1,28 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Cargo lock — committed for binary crates, ignored for libraries.
+# ampaper is a binary so we keep Cargo.lock under version control;
+# this line stays here as a placeholder so a future split into a
+# lib crate can flip the policy without churn.
+
+# IDE
+/.vscode
+/.idea
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local scratch
+/scratch
+/tmp
+*.log
+
+# Reference vendoring (the original paperbak-1.10.src and the
+# mrpods checkout sit under /reference/ when present, but we do
+# NOT ship them in our repo — they are read-only ground truth
+# for cross-checking and have their own licenses + upstreams.
+/reference

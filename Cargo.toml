@@ -1,0 +1,28 @@
+[package]
+name = "ampaper"
+version = "0.0.1"
+edition = "2024"
+description = "Rust port of PaperBack — back up files as printable, scannable bitmaps on paper"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/amrust/ampaper"
+readme = "README.md"
+authors = ["ampaper contributors"]
+rust-version = "1.85"
+
+[dependencies]
+# Encoder/decoder side intentionally starts empty — we add deps as
+# the milestones pull them in (image, bzip2, RS-ECC crate or hand-
+# rolled, aes for the 256 forward mode + legacy 192 read path, etc).
+# See docs/MILESTONES.md for the staging order.
+
+[target.'cfg(windows)'.dependencies]
+# GUI + printing + scanning lives behind cfg(windows) for now.
+# When we add WIA / TWAIN / GDI bindings via windows-rs, the
+# feature list will grow here. cfg(unix) builds aim for a CLI
+# encoder/decoder that round-trips the same bitstream so anyone
+# on Linux/macOS can decode an existing PaperBack scan even if
+# they can't drive a printer/scanner from the GUI.
+
+[dev-dependencies]
+# proptest for the encoder/decoder round-trip property tests
+# once the format machinery lands. Kept light to start.
