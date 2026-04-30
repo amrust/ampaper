@@ -6,3 +6,4 @@
 // docs/PAPERBAK-HACKS.md. Read both before extending this crate.
 
 pub mod block;
+pub mod crc;

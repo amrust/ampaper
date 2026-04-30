@@ -52,6 +52,17 @@ pub const PBM_COMPRESSED: u8 = 0x01;
 /// SuperBlock mode bit: data is AES-192-CBC encrypted. paperbak.h:71.
 pub const PBM_ENCRYPTED: u8 = 0x02;
 
+/// Number of bytes covered by the per-block CRC: addr (4) + the
+/// 90-byte payload region. The CRC and ECC fields are excluded.
+/// Same coverage applies to SuperBlock — see FORMAT-V1.md §2.2 / §3.
+pub const CRC_COVERAGE_BYTES: usize = 4 + NDATA;
+const _: () = assert!(CRC_COVERAGE_BYTES == 94);
+
+/// XOR mask applied to the raw CRC-16 before storing it on the wire.
+/// `Printer.cpp:174` (encode) and `Decoder.cpp:235` (verify) — present
+/// to break the trivial all-zero-block / CRC-of-zero false-positive.
+pub const CRC_FINAL_XOR: u16 = 0x55AA;
+
 // --- Block -------------------------------------------------------------------
 
 /// A 128-byte block as it appears on the wire. Carries either a
@@ -142,6 +153,25 @@ impl Block {
     pub fn is_data(&self) -> bool {
         !self.is_super() && self.ngroup() == 0
     }
+
+    /// Compute the CRC the way the encoder does it: CRC-16/CCITT
+    /// over (addr || data) — the first [`CRC_COVERAGE_BYTES`] bytes
+    /// of the wire form — then XOR with [`CRC_FINAL_XOR`]. See
+    /// FORMAT-V1.md §2.2; mirrors `Printer.cpp:174`.
+    ///
+    /// Does not read or mutate `self.crc`; caller compares the
+    /// returned value or assigns it via `block.crc = block.compute_crc()`.
+    #[must_use]
+    pub fn compute_crc(&self) -> u16 {
+        crate::crc::crc16(&self.to_bytes()[..CRC_COVERAGE_BYTES]) ^ CRC_FINAL_XOR
+    }
+
+    /// Returns true when [`Self::crc`] matches the expected value
+    /// computed from the rest of the block. Mirrors `Decoder.cpp:235-236`.
+    #[must_use]
+    pub fn verify_crc(&self) -> bool {
+        self.compute_crc() == self.crc
+    }
 }
 
 // --- SuperBlock --------------------------------------------------------------
@@ -228,6 +258,22 @@ impl SuperBlock {
             crc: u16::from_le_bytes(buf[94..96].try_into().unwrap()),
             ecc,
         })
+    }
+
+    /// Same convention as [`Block::compute_crc`]: CRC-16/CCITT over
+    /// the first [`CRC_COVERAGE_BYTES`] of the wire form, XOR'd with
+    /// [`CRC_FINAL_XOR`]. The encoder treats Block and SuperBlock as
+    /// the same 128 bytes for CRC purposes; this just keeps that
+    /// symmetry on the Rust side.
+    #[must_use]
+    pub fn compute_crc(&self) -> u16 {
+        crate::crc::crc16(&self.to_bytes()[..CRC_COVERAGE_BYTES]) ^ CRC_FINAL_XOR
+    }
+
+    /// Returns true when [`Self::crc`] matches the expected value.
+    #[must_use]
+    pub fn verify_crc(&self) -> bool {
+        self.compute_crc() == self.crc
     }
 }
 
@@ -394,6 +440,116 @@ mod tests {
         bytes[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         let err = SuperBlock::from_bytes(&bytes).unwrap_err();
         assert_eq!(err, FormatError::NotASuperBlock { addr: 0x1234_5678 });
+    }
+
+    /// CRC of an all-zero (addr, data) is the bare CRC-CCITT init
+    /// value (0x0000), XOR'd with the format's 0x55AA mask.
+    /// This pins the constant 0x55AA so a typo (e.g. swapping with
+    /// 0xAA55) trips loudly without needing a real 1.10 vector.
+    #[test]
+    fn block_crc_of_all_zero_payload_is_xor_mask() {
+        let b = zero_block();
+        assert_eq!(b.compute_crc(), CRC_FINAL_XOR);
+    }
+
+    #[test]
+    fn block_compute_then_verify_round_trip() {
+        let mut b = Block {
+            addr: 0x1234_5678,
+            data: core::array::from_fn(|i| (i * 3) as u8),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        assert!(b.verify_crc());
+    }
+
+    #[test]
+    fn block_verify_crc_rejects_data_mutation() {
+        let mut b = Block {
+            addr: 1234,
+            data: core::array::from_fn(|i| i as u8),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        assert!(b.verify_crc());
+        // Flip a single bit anywhere in the covered range; CRC must reject.
+        b.data[42] ^= 1;
+        assert!(!b.verify_crc());
+    }
+
+    #[test]
+    fn block_verify_crc_rejects_addr_mutation() {
+        let mut b = Block {
+            addr: 1234,
+            data: [0xAA; NDATA],
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        assert!(b.verify_crc());
+        // ECC sits past the CRC coverage and isn't covered, but addr is.
+        b.addr ^= 0x1000;
+        assert!(!b.verify_crc());
+    }
+
+    #[test]
+    fn block_verify_crc_ignores_ecc_mutation() {
+        // ECC is excluded from CRC coverage by construction (it's the
+        // outer redundancy layer over the entire block including the
+        // CRC). Mutating ECC must not affect verify_crc's verdict.
+        let mut b = Block {
+            addr: 99 * NDATA as u32,
+            data: [0x33; NDATA],
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        b.crc = b.compute_crc();
+        assert!(b.verify_crc());
+        b.ecc[0] = 0xFF;
+        b.ecc[31] = 0xFF;
+        assert!(b.verify_crc(), "ecc field must not affect block CRC");
+    }
+
+    #[test]
+    fn super_block_compute_then_verify_round_trip() {
+        let mut s = SuperBlock {
+            datasize: 12_345,
+            pagesize: 67_890,
+            origsize: 11_111,
+            mode: PBM_COMPRESSED,
+            attributes: 0x80,
+            page: 7,
+            modified: 0x01D5_C0FF_EE12_3456,
+            filecrc: 0xBEEF,
+            name: core::array::from_fn(|i| (i + 1) as u8),
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        s.crc = s.compute_crc();
+        assert!(s.verify_crc());
+    }
+
+    #[test]
+    fn super_block_verify_crc_rejects_field_mutation() {
+        let mut s = SuperBlock {
+            datasize: 1,
+            pagesize: 1,
+            origsize: 1,
+            mode: 0,
+            attributes: 0,
+            page: 1,
+            modified: 0,
+            filecrc: 0,
+            name: [0; 64],
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        s.crc = s.compute_crc();
+        assert!(s.verify_crc());
+        s.page = 2;
+        assert!(!s.verify_crc());
     }
 
     /// Field offsets must match FORMAT-V1.md §3 byte by byte. If any
