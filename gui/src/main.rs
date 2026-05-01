@@ -17,7 +17,14 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 720.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("ampaper"),
+            .with_title("ampaper")
+            // Suppress eframe's bundled placeholder "egui" icon. Per
+            // the eframe / egui docs (epi.rs:314, viewport.rs:420),
+            // setting an empty IconData tells the framework to fall
+            // back to the OS default — which on Windows means the
+            // standard exe icon (and once we have an .ico embedded
+            // via a build-resource step, that's what shows up here).
+            .with_icon(eframe::egui::IconData::default()),
         ..Default::default()
     };
     eframe::run_native(

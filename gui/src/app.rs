@@ -113,16 +113,19 @@ impl eframe::App for AmpaperApp {
                 });
             });
 
-        // Central area: tab dispatch. egui 0.34 hands `ui` to App::ui
-        // already scoped to the central region (after the side and
-        // bottom panels carve out their space), so we draw directly.
-        match self.tab {
+        // Central area: tab dispatch. The bare `ui` from App::ui has
+        // no margin or background color (per eframe 0.34 docs), so
+        // wrap it in CentralPanel to pick up the standard panel_fill
+        // — otherwise the central region falls through to the much
+        // darker window fill, which makes the content area look
+        // pitch-black against the medium-grey side panels.
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.tab {
             Tab::Encode => self.encode.show(ui),
             Tab::Decode => self.decode.show(ui),
             Tab::Settings => self.settings.show(ui),
             Tab::Print => views::stubs::show_print_stub(ui),
             Tab::ScanDevice => views::stubs::show_scan_device_stub(ui),
-        }
+        });
     }
 }
 
