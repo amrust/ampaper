@@ -274,6 +274,20 @@ impl DecodeView {
     }
 
     fn suggested_save_name(&self) -> String {
+        // Prefer the original filename the encoder embedded in the
+        // SuperBlock — PB 1.10 stores it in name[0..32], v2 in
+        // V2SuperBlockCell1.name[0..64]. Walk the per-page reports
+        // for the first one that recovered a name.
+        for r in &self.reports {
+            if let Some(name) = &r.original_filename
+                && !name.is_empty()
+            {
+                return name.clone();
+            }
+        }
+        // Fall back to the input bitmap's stem with a `.recovered`
+        // marker so the user doesn't accidentally overwrite the
+        // bitmap they dropped in.
         if let Some(first) = self.queued_paths.first()
             && let Some(stem) = first.file_stem().and_then(|s| s.to_str())
         {

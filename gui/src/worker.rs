@@ -14,11 +14,13 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use ampaper::block::{Block, MAXSIZE, SUPERBLOCK_ADDR};
+use ampaper::block::{Block, BLOCK_BYTES, MAXSIZE, SUPERBLOCK_ADDR, SuperBlock};
 use ampaper::encoder::{
     EncodeError, EncodeOptions, EncodedPage, FileMeta, encode, encode_v2,
 };
-use ampaper::format_v2::{V2_SUPERBLOCK_ADDR_CELL1, V2_SUPERBLOCK_ADDR_CELL2};
+use ampaper::format_v2::{
+    V2_SUPERBLOCK_ADDR_CELL1, V2_SUPERBLOCK_ADDR_CELL2, V2SuperBlockCell1,
+};
 use ampaper::scan::{ScanGeometry, detect_geometry, scan_decode, scan_extract};
 
 /// Snapshot of an encode request, populated from the UI when the
@@ -213,6 +215,11 @@ pub struct PageReport {
     pub ny: u32,
     /// Length `nx * ny`, row-major.
     pub cells: Vec<CellStatus>,
+    /// Filename the encoder stored in the SuperBlock, if a SuperBlock
+    /// (v1 or v2 cell 1) survived CRC on this page. PB 1.10 caps at
+    /// 31 chars + NUL; v2 cell 1 carries the full 63-char + NUL slot.
+    /// Empty / NUL-only names yield `None`.
+    pub original_filename: Option<String>,
 }
 
 /// Messages the decode worker posts back to the UI thread.
@@ -279,6 +286,7 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
                 nx: 1,
                 ny: 1,
                 cells: vec![CellStatus::Damaged],
+                original_filename: None,
             }));
         }
     }
@@ -299,19 +307,78 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
 }
 
 /// Run scan_extract over a single page and bucket each resulting
-/// cell into a [`CellStatus`]. Returns `None` when the geometry
-/// detector couldn't find the PaperBack grid in the bitmap.
+/// cell into a [`CellStatus`]. Also walks the cells once more to
+/// pull the original filename out of the first valid SuperBlock —
+/// PB 1.10 stores it in `SuperBlock.name[0..32]` (FORMAT-V1.md §3.2),
+/// v2 stores it in `V2SuperBlockCell1.name[0..64]` (FORMAT-V2.md
+/// §2.1). Throwing this away would force the user to retype the
+/// filename every time they save a recovered file.
+///
+/// Returns `None` when the geometry detector couldn't find the
+/// PaperBack grid in the bitmap.
 fn classify_page(page: &DecodePage) -> Option<PageReport> {
     let geometry: ScanGeometry = detect_geometry(&page.luma, page.width, page.height)?;
     let cells = scan_extract(&page.luma, page.width, page.height)?;
     debug_assert_eq!(cells.len(), (geometry.nposx * geometry.nposy) as usize);
-    let statuses = cells.iter().map(classify_cell).collect();
+    let statuses: Vec<CellStatus> = cells.iter().map(classify_cell).collect();
+    let original_filename = extract_original_filename(&cells);
     Some(PageReport {
         source: page.source.clone(),
         nx: geometry.nposx,
         ny: geometry.nposy,
         cells: statuses,
+        original_filename,
     })
+}
+
+/// Walk the page's cells looking for the first CRC-valid SuperBlock
+/// (v1 or v2 cell 1) and return its embedded filename if any. Stops
+/// at the first valid match. Filler-superblock copies sprinkled
+/// across the trailing cells of a page all carry the same name, so
+/// "first match" is correct.
+fn extract_original_filename(cells: &[[u8; BLOCK_BYTES]]) -> Option<String> {
+    for cell in cells {
+        let block = Block::from_bytes(cell);
+        if !block.verify_crc() {
+            continue;
+        }
+        match block.addr {
+            SUPERBLOCK_ADDR => {
+                if let Ok(sb) = SuperBlock::from_bytes(cell)
+                    && sb.verify_crc()
+                {
+                    // v1 reserves bytes 32..64 of `name` for the AES
+                    // salt + IV (FORMAT-V1.md §3.2 / PAPERBAK-HACKS
+                    // §2.1) — only bytes 0..32 are filename. Take a
+                    // u8 slice up to the first NUL.
+                    if let Some(name) = nul_terminated_utf8(&sb.name[..32]) {
+                        return Some(name);
+                    }
+                }
+            }
+            V2_SUPERBLOCK_ADDR_CELL1 => {
+                let parsed = V2SuperBlockCell1::from_data_bytes(&block.data);
+                if let Some(name) = nul_terminated_utf8(&parsed.name) {
+                    return Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Slice up to the first NUL, decoded as UTF-8. Returns None for an
+/// empty / leading-NUL field. Lossy decode is fine — PB 1.10 wrote
+/// Win32 ANSI bytes which are typically 7-bit ASCII for archival
+/// filenames; v2 wrote real UTF-8.
+fn nul_terminated_utf8(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    Some(s)
 }
 
 fn classify_cell(cell: &[u8; ampaper::block::BLOCK_BYTES]) -> CellStatus {

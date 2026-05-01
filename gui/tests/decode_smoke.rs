@@ -95,7 +95,7 @@ fn percent_damaged(report: &PageReport) -> f32 {
 }
 
 #[test]
-fn worker_v1_decode_round_trips_clean_bitmap() {
+fn worker_v1_decode_round_trips_clean_bitmap_and_recovers_filename() {
     let tmp = std::env::temp_dir().join("ampaper-gui-decode-test-v1");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -133,6 +133,16 @@ fn worker_v1_decode_round_trips_clean_bitmap() {
     assert!(
         damaged <= 1.0,
         "synthetic clean bitmap should have ≤1% damaged cells, got {damaged:.1}%"
+    );
+
+    // Filename recovery: meta() in this test uses "smoke.bin", which
+    // PaperBack 1.10's 31-char cap fits comfortably. The worker
+    // should pull this out of the SuperBlock so the GUI's "Save
+    // as..." defaults to "smoke.bin" instead of the bitmap stem.
+    assert_eq!(
+        report.original_filename.as_deref(),
+        Some("smoke.bin"),
+        "v1 SuperBlock filename should round-trip through worker classification"
     );
 }
 
@@ -175,6 +185,66 @@ fn worker_v2_decode_round_trips_with_password() {
     assert!(
         damaged <= 1.0,
         "v2 clean bitmap should have ≤1% damaged cells, got {damaged:.1}%"
+    );
+    assert_eq!(
+        report.original_filename.as_deref(),
+        Some("smoke.bin"),
+        "v2 cell 1 filename should round-trip through worker classification"
+    );
+}
+
+/// Cross-check against the real PaperBack 1.10 golden vector. The
+/// lorem.bmp file was produced by PB 1.10 from lorem.input; the
+/// worker should recover the filename `lorem.input` from the
+/// SuperBlock (NOT default to `lorem.recovered.bin`). Mirrors the
+/// concrete bug the user reported: dragging a real PB 1.10 BMP in
+/// must default the save dialog to the original filename.
+#[test]
+fn worker_recovers_filename_from_real_paperbak_1_10_bmp() {
+    let bmp_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("tests")
+        .join("golden")
+        .join("v1-paperbak")
+        .join("lorem.bmp");
+    if !bmp_path.exists() {
+        eprintln!("skipping golden test — {} not present", bmp_path.display());
+        return;
+    }
+
+    let img = image::open(&bmp_path).unwrap().to_luma8();
+    let (w, h) = img.dimensions();
+    let req = DecodeRequest {
+        pages: vec![DecodePage {
+            source: bmp_path,
+            luma: img.into_raw(),
+            width: w,
+            height: h,
+        }],
+        password: None,
+    };
+    let (recovered, reports) = run(req).expect("PB 1.10 golden BMP must decode");
+
+    // The recovered bytes match the committed lorem.input file.
+    let expected = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests")
+            .join("golden")
+            .join("v1-paperbak")
+            .join("lorem.input"),
+    )
+    .unwrap();
+    assert_eq!(recovered, expected);
+
+    // The original filename must be present and equal to the file
+    // that was fed into PB 1.10 — `lorem.input`. This is the
+    // user-facing fix: "Save as..." defaults to the right name.
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].original_filename.as_deref(),
+        Some("lorem.input"),
+        "real PaperBack 1.10 BMP must round-trip the original filename"
     );
 }
 
