@@ -1,0 +1,19 @@
+# Golden-vector files are byte-exact ground truth — no line-ending
+# conversion. Reproducibility depends on the bytes being identical
+# on every checkout regardless of platform.
+tests/golden/**/*.input  -text
+tests/golden/**/*.bmp    -text binary
+tests/golden/**/*.png    -text binary
+
+# C reference source under reference/ is read-only, never edited
+# from the Rust side. Keep it as-is rather than letting Windows
+# checkouts CRLF-mangle line numbers (cited file:line refs in our
+# docs assume the Borland-original LF endings). reference/ is also
+# gitignored, so this rule is defensive only.
+reference/**/*.cpp       -text
+reference/**/*.h         -text
+reference/**/*.c         -text
+
+# Rust source uses LF on commit; cargo fmt enforces this anyway,
+# but the explicit rule keeps git off our backs on Windows.
+*.rs                     text eol=lf
