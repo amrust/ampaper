@@ -31,6 +31,21 @@ cbc = "0.2"
 pbkdf2 = "0.13"
 sha1 = "0.11"
 
+# v2 crypto stack (M11). PBKDF2-HMAC-SHA-256 at 600k iterations
+# derives the AES-256 key; AES-256-GCM is the AEAD wrapping the
+# (optionally bzip2'd) plaintext. See docs/FORMAT-V2.md §3 +
+# docs/ENCRYPTION-DECISION.md. aes-gcm 0.11.0-rc tracks the
+# RustCrypto cipher 0.5 / aes 0.9 / pbkdf2 0.13 / sha2 0.11 line
+# we already use; the rc tag is the latest tagged release at the
+# time of writing — a stable tag will replace it when published.
+aes-gcm = "0.11.0-rc.3"
+sha2 = "0.11"
+
+# Cross-platform OS entropy. The KDF salt and GCM IV must be fresh
+# per encode operation and unguessable; getrandom is the standard
+# RustCrypto-adjacent way to ask the OS for that.
+getrandom = "0.4"
+
 # Other deps (windows-rs for GDI / WIA / TWAIN at M9/M10) land
 # at the milestone that needs them. See docs/MILESTONES.md for
 # the staging order.

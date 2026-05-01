@@ -26,7 +26,12 @@ use crate::block::{
     Block, ECC_BYTES, MAXSIZE, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, SuperBlock,
 };
 use crate::bz;
+use crate::format_v2::{
+    PBM_V2_COMPRESSED, PBM_V2_ENCRYPTED, V2_FORMAT_VERSION, V2_GCM_IV_LEN, V2_GCM_TAG_LEN,
+    V2_KDF_SALT_LEN, V2SuperBlockCell1, V2SuperBlockCell2,
+};
 use crate::page::{self, BLACK_PAPER, PageGeometry, PlacedBlock};
+use crate::v2_crypto::{V2CryptoError, build_aad, derive_key_v2, encrypt_v2};
 
 /// File-level metadata baked into every page's SuperBlock.
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +110,21 @@ pub enum EncodeError {
         cells: u32,
         redundancy: u8,
     },
+    /// AES-256-GCM rejected the encryption inputs. Practically
+    /// unreachable for sane sizes; the type system requires the
+    /// fallible signature.
+    V2EncryptFailed(V2CryptoError),
+    /// Failed to obtain OS entropy for the KDF salt or GCM IV. The
+    /// encoder refuses to fall back to deterministic or weak entropy
+    /// sources — that would silently downgrade security. Surface the
+    /// failure so the caller can decide what to do.
+    V2EntropyFailed(String),
+    /// Total page count exceeds u16 capacity. v2's SuperBlock cell 1
+    /// stores `page_count` as u16 (FORMAT-V2.md §2.1 / §8); 65535
+    /// pages × ~177 KB/page = ~11 GB. Hitting this means input ≫
+    /// MAXSIZE allows and is unlikely to round-trip even if we widened
+    /// the field.
+    V2TooManyPages { page_count: u32 },
 }
 
 impl core::fmt::Display for EncodeError {
@@ -131,6 +151,14 @@ impl core::fmt::Display for EncodeError {
                  ≥ {} total",
                 redundancy + 1,
                 2 * redundancy + 2
+            ),
+            Self::V2EncryptFailed(e) => write!(f, "v2 AES-256-GCM encryption failed: {e}"),
+            Self::V2EntropyFailed(msg) => {
+                write!(f, "OS entropy unavailable for v2 salt/IV: {msg}")
+            }
+            Self::V2TooManyPages { page_count } => write!(
+                f,
+                "v2 input requires {page_count} pages; cell-1 page_count is u16 (max 65535)"
             ),
         }
     }
@@ -367,6 +395,350 @@ fn encode_one_page(
         width: options.geometry.bitmap_width(),
         height: options.geometry.bitmap_height(),
     }
+}
+
+// === v2 encode pathway (M11) =====================================
+// Spec: docs/FORMAT-V2.md.
+//
+// v2 differs from v1 in three ways the encoder cares about:
+//   1. The SuperBlock occupies TWO cells (cell 1 = file metadata at
+//      addr 0xFFFFFFFE, cell 2 = crypto envelope at 0xFFFFFFFD)
+//      instead of one. Each "string" on the page therefore costs an
+//      extra cell — pagesize drops accordingly.
+//   2. The data buffer is AES-256-GCM ciphertext + 16-byte tag, not
+//      the raw (compressed) plaintext. Encryption sits ABOVE the
+//      block layer: the block-level RS + CRC + group-recovery logic
+//      is identical to v1.
+//   3. AAD binds the GCM tag to (feature_flags, page_count, origsize,
+//      datasize), so an attacker cannot truncate pages or flip flag
+//      bits without invalidating the tag.
+
+/// Encode `input` into one or more ampaper-v2 pages with AES-256-GCM
+/// encryption. Generates fresh KDF salt + GCM IV via OS entropy
+/// (`getrandom`). For deterministic test output, use
+/// [`encode_v2_with_kat`].
+///
+/// Pipeline:
+///   1. Optional bzip2 (when `options.compress`) — applied BEFORE
+///      encryption (compress-then-encrypt; spec FORMAT-V2.md §8).
+///   2. Generate kdf_salt (32 B) + gcm_iv (12 B) from OS entropy.
+///   3. Derive 32-byte AES-256 key via PBKDF2-HMAC-SHA-256 at 600,000
+///      iterations (FORMAT-V2.md §3.2).
+///   4. Compute datasize = ciphertext.len() + 16 (tag), origsize =
+///      input.len(), pagesize_v2 (one extra cell per string for the
+///      second SuperBlock cell), npages.
+///   5. Build AAD = magic + feature_flags + page_count + origsize +
+///      datasize.
+///   6. Encrypt: ciphertext_with_tag = AES-256-GCM(key, iv, AAD, buf).
+///   7. Per page: build cell 1 + cell 2 + data blocks + recovery
+///      blocks; render.
+pub fn encode_v2(
+    input: &[u8],
+    options: &EncodeOptions,
+    meta: &FileMeta<'_>,
+    password: &[u8],
+) -> Result<Vec<EncodedPage>, EncodeError> {
+    let mut kdf_salt = [0u8; V2_KDF_SALT_LEN];
+    let mut gcm_iv = [0u8; V2_GCM_IV_LEN];
+    getrandom::fill(&mut kdf_salt).map_err(|e| EncodeError::V2EntropyFailed(e.to_string()))?;
+    getrandom::fill(&mut gcm_iv).map_err(|e| EncodeError::V2EntropyFailed(e.to_string()))?;
+    encode_v2_with_kat(input, options, meta, password, &kdf_salt, &gcm_iv)
+}
+
+/// Test/KAT entry point for [`encode_v2`] that takes a fixed
+/// `kdf_salt` + `gcm_iv` instead of generating fresh entropy. Used
+/// by golden-vector tests to pin byte-equal output.
+///
+/// Production callers MUST use [`encode_v2`] — re-using a fixed IV
+/// across encodes catastrophically breaks AES-GCM.
+pub fn encode_v2_with_kat(
+    input: &[u8],
+    options: &EncodeOptions,
+    meta: &FileMeta<'_>,
+    password: &[u8],
+    kdf_salt: &[u8; V2_KDF_SALT_LEN],
+    gcm_iv: &[u8; V2_GCM_IV_LEN],
+) -> Result<Vec<EncodedPage>, EncodeError> {
+    if input.len() > MAXSIZE as usize {
+        return Err(EncodeError::InputTooLarge { len: input.len() });
+    }
+    if !(NGROUP_MIN..=NGROUP_MAX).contains(&options.redundancy) {
+        return Err(EncodeError::InvalidRedundancy {
+            redundancy: options.redundancy,
+        });
+    }
+
+    let nx = options.geometry.nx();
+    let ny = options.geometry.ny();
+    let cells = nx * ny;
+    let redundancy = u32::from(options.redundancy);
+    // v2 page-too-small: at minimum (redundancy+1)*3 cells (3 cells
+    // per string = 2 supers + 1 data block). Stricter than v1 by one
+    // cell per string.
+    if nx < redundancy + 1 || ny < 3 || cells < 3 * (redundancy + 1) {
+        return Err(EncodeError::PageTooSmall {
+            nx,
+            ny,
+            cells,
+            redundancy: options.redundancy,
+        });
+    }
+
+    // --- Step 1: optional compression -------------------------------
+    let plaintext: Vec<u8> = if options.compress {
+        bz::compress(input, bz::BlockSize::Max)
+    } else {
+        input.to_vec()
+    };
+    let origsize = input.len() as u32;
+    let mut feature_flags = PBM_V2_ENCRYPTED;
+    if options.compress {
+        feature_flags |= PBM_V2_COMPRESSED;
+    }
+
+    // --- Steps 3-4: derive key, compute layout sizes ----------------
+    let key = derive_key_v2(password, kdf_salt);
+    // Ciphertext + tag length = plaintext + 16. We need this before
+    // calling encrypt because AAD includes datasize, and AAD is an
+    // input to the GCM tag computation. The +16 is fixed by the GCM
+    // tag length (V2_GCM_TAG_LEN).
+    let datasize = (plaintext.len() + V2_GCM_TAG_LEN) as u32;
+    let pagesize_v2 = pagesize_v2(cells, redundancy);
+    let page_count_u32 = datasize.div_ceil(pagesize_v2).max(1);
+    if page_count_u32 > u16::MAX as u32 {
+        return Err(EncodeError::V2TooManyPages {
+            page_count: page_count_u32,
+        });
+    }
+    let page_count = page_count_u32 as u16;
+
+    // --- Step 5: AAD ------------------------------------------------
+    let aad = build_aad(feature_flags, page_count, origsize, datasize);
+
+    // --- Step 6: encrypt -------------------------------------------
+    let ciphertext_with_tag =
+        encrypt_v2(&key, gcm_iv, &aad, &plaintext).map_err(EncodeError::V2EncryptFailed)?;
+    debug_assert_eq!(ciphertext_with_tag.len() as u32, datasize);
+
+    // --- Step 7: build pages ---------------------------------------
+    let mut pages = Vec::with_capacity(page_count as usize);
+    for page_index in 0..page_count_u32 {
+        let page = encode_one_page_v2(
+            &ciphertext_with_tag,
+            datasize,
+            pagesize_v2,
+            page_index,
+            page_count,
+            origsize,
+            feature_flags,
+            kdf_salt,
+            gcm_iv,
+            meta,
+            options,
+        );
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+/// v2 pagesize formula. Mirrors v1's `(cells - redundancy - 2) /
+/// (redundancy+1) * redundancy * NDATA`, but reserves one extra cell
+/// per string for the second SuperBlock cell.
+///
+/// Each v2 string holds: 2 supers + nstring data/recovery cells =
+/// (nstring + 2) cells. With (redundancy+1) strings per page,
+/// total used = (redundancy+1)*(nstring+2). Solving for nstring with
+/// the same conservative margin v1 keeps:
+///
+/// ```text
+/// nstring_v2 = (cells - 2*redundancy - 3) / (redundancy + 1)
+/// pagesize_v2 = nstring_v2 * redundancy * NDATA
+/// ```
+#[must_use]
+fn pagesize_v2(cells: u32, redundancy: u32) -> u32 {
+    let nstring = if cells > 2 * redundancy + 3 {
+        (cells - 2 * redundancy - 3) / (redundancy + 1)
+    } else {
+        0
+    };
+    nstring * redundancy * (NDATA as u32)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_one_page_v2(
+    buf: &[u8],
+    datasize: u32,
+    pagesize_v2: u32,
+    page_index: u32,
+    page_count: u16,
+    origsize: u32,
+    feature_flags: u8,
+    kdf_salt: &[u8; V2_KDF_SALT_LEN],
+    gcm_iv: &[u8; V2_GCM_IV_LEN],
+    meta: &FileMeta<'_>,
+    options: &EncodeOptions,
+) -> EncodedPage {
+    let nx = options.geometry.nx();
+    let redundancy = u32::from(options.redundancy);
+
+    // --- Build SuperBlock cell 1 + cell 2 for this page ------------
+    let mut name_bytes = [0u8; 64];
+    // v2 doesn't reuse name[32..64] for AES salt+IV (cell 2 owns
+    // the crypto envelope), so we get the full 63-byte filename
+    // budget (NUL-terminated). Keep parity with v1's truncation
+    // posture for graceful behavior on long names.
+    let name_len = meta.name.len().min(63);
+    name_bytes[..name_len].copy_from_slice(&meta.name.as_bytes()[..name_len]);
+
+    let cell1 = V2SuperBlockCell1 {
+        format_version: V2_FORMAT_VERSION,
+        feature_flags,
+        page: (page_index + 1) as u16,
+        page_count,
+        datasize,
+        origsize,
+        pagesize: pagesize_v2,
+        modified: meta.modified,
+        name: name_bytes,
+    };
+    let cell2 = V2SuperBlockCell2 {
+        kdf_salt: *kdf_salt,
+        gcm_iv: *gcm_iv,
+        reserved: [0; crate::format_v2::V2_CELL2_RESERVED_LEN],
+    };
+    let cell1_bytes = cell1.to_block().to_bytes();
+    let cell2_bytes = cell2.to_block().to_bytes();
+
+    // --- Determine layout for this page ----------------------------
+    let offset_start = page_index * pagesize_v2;
+    let l = (datasize - offset_start).min(pagesize_v2);
+    let n = l.div_ceil(NDATA as u32);
+    let nstring = n.div_ceil(redundancy);
+    let cells_per_string = nstring + 2;
+
+    // --- Place cell 1 + cell 2 super copies for each string --------
+    // Each of the (redundancy + 1) strings starts with cell 1 at
+    // row 0 and cell 2 at row 1 of that string.
+    let mut placed: Vec<PlacedBlock> = Vec::new();
+    for j in 0..=redundancy {
+        let cell1_idx = cell_in_string_v2(j, 0, cells_per_string, nx, redundancy);
+        placed.push(PlacedBlock {
+            cell_index: cell1_idx,
+            bytes: cell1_bytes,
+        });
+        let cell2_idx = cell_in_string_v2(j, 1, cells_per_string, nx, redundancy);
+        placed.push(PlacedBlock {
+            cell_index: cell2_idx,
+            bytes: cell2_bytes,
+        });
+    }
+
+    // --- Place data blocks + recovery, group by group --------------
+    // Same XOR-checksum recovery story as v1: each group's recovery
+    // block is `0xFF ^ d0 ^ ... ^ d_{redundancy-1}`. Decoder XOR-
+    // recovers a single missing block per group via the same path.
+    let mut offset = offset_start;
+    for i in 0..nstring {
+        let mut cksum_data = [0xFFu8; NDATA];
+        for j in 0..redundancy {
+            let block_addr = offset;
+            let mut data = [0u8; NDATA];
+            let take = (datasize.saturating_sub(offset) as usize).min(NDATA);
+            if take > 0 {
+                data[..take].copy_from_slice(&buf[offset as usize..offset as usize + take]);
+            }
+            for (c, &d) in cksum_data.iter_mut().zip(data.iter()) {
+                *c ^= d;
+            }
+            let mut block = Block {
+                addr: block_addr,
+                data,
+                crc: 0,
+                ecc: [0; ECC_BYTES],
+            };
+            block.crc = block.compute_crc();
+            block.ecc = block.compute_ecc();
+            // row_in_string = i + 2 (rows 0,1 are cell1+cell2 supers;
+            // rows 2..2+nstring are slot j's data cells across groups).
+            let cell = cell_in_string_v2(j, i + 2, cells_per_string, nx, redundancy);
+            placed.push(PlacedBlock {
+                cell_index: cell,
+                bytes: block.to_bytes(),
+            });
+            offset += NDATA as u32;
+        }
+        // Recovery block, same shape as v1.
+        let group_start_offset = offset_start + i * redundancy * (NDATA as u32);
+        let recovery_addr = group_start_offset ^ (redundancy << 28);
+        let mut recovery = Block {
+            addr: recovery_addr,
+            data: cksum_data,
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        recovery.crc = recovery.compute_crc();
+        recovery.ecc = recovery.compute_ecc();
+        let cell = cell_in_string_v2(redundancy, i + 2, cells_per_string, nx, redundancy);
+        placed.push(PlacedBlock {
+            cell_index: cell,
+            bytes: recovery.to_bytes(),
+        });
+    }
+
+    // --- Fill remaining cells with extra (cell1, cell2) copies -----
+    // Alternating super-pair fillers. Either cell type is enough for
+    // a v2 decoder to find SOMETHING valid in the trailing cells, so
+    // alternating gives both types redundancy.
+    let used_cells: std::collections::HashSet<u32> = placed.iter().map(|p| p.cell_index).collect();
+    let total_cells = nx * options.geometry.ny();
+    let mut filler_toggle = false;
+    for cell in 0..total_cells {
+        if !used_cells.contains(&cell) {
+            placed.push(PlacedBlock {
+                cell_index: cell,
+                bytes: if filler_toggle { cell2_bytes } else { cell1_bytes },
+            });
+            filler_toggle = !filler_toggle;
+        }
+    }
+
+    let bitmap = page::render(&options.geometry, &placed, options.black);
+    EncodedPage {
+        bitmap,
+        width: options.geometry.bitmap_width(),
+        height: options.geometry.bitmap_height(),
+    }
+}
+
+/// Compute the absolute cell index for `row_in_string` of string `j`
+/// in a v2 page. Mirrors v1's `data_or_recovery_cell` / `first_cell_of_string`
+/// stepping but uses (nstring+2)-cell strings.
+///
+/// `row_in_string ∈ 0..cells_per_string`:
+///   0       → SuperBlock cell 1 copy (slot j)
+///   1       → SuperBlock cell 2 copy (slot j)
+///   2..nstring+1 → data slot j of group (row_in_string - 2)
+///                  for j < redundancy, or recovery block of group
+///                  (row_in_string - 2) for j == redundancy.
+fn cell_in_string_v2(
+    j: u32,
+    row_in_string: u32,
+    cells_per_string: u32,
+    nx: u32,
+    redundancy: u32,
+) -> u32 {
+    let mut k = j * cells_per_string;
+    if cells_per_string < nx {
+        // Compact regime: linear stepping within the string.
+        k += row_in_string;
+    } else {
+        // Wide regime: rotate per string, mirroring v1's
+        // Printer.cpp:875 / 906-908 logic but with cells_per_string
+        // (= nstring + 2) as the modulus.
+        let rot = (nx / (redundancy + 1) * j + nx - k % nx) % nx;
+        k += (row_in_string + rot) % cells_per_string;
+    }
+    k
 }
 
 /// Cell where the j-th group string starts (its superblock copy).
@@ -682,6 +1054,204 @@ mod tests {
             }
         }
         assert_eq!(recovery_block.data, expected);
+    }
+
+    // === v2 round-trip tests (M11) ============================
+    //
+    // The full encode/decode cycle is exercised through the public
+    // crate::decoder::decode entry point, which auto-detects v2 cells
+    // and dispatches to the v2 reassembly + GCM-decrypt path. These
+    // tests live in encoder.rs because they originate from the v2
+    // encoder; the decoder-side error paths (wrong password, missing
+    // header, etc.) live in decoder.rs.
+
+    fn v2_decode(pages: &[EncodedPage], geometry: &PageGeometry, password: &[u8]) -> Vec<u8> {
+        let bitmaps: Vec<Vec<u8>> = pages.iter().map(|p| p.bitmap.clone()).collect();
+        let opts = crate::decoder::DecodeOptions {
+            geometry: *geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        crate::decoder::decode(&bitmaps, &opts, Some(password))
+            .expect("v2 encoded pages must decode in tests")
+    }
+
+    /// v2 encode → decode round-trip with deterministic salt+IV
+    /// recovers the input bytes exactly.
+    #[test]
+    fn v2_round_trip_single_page_no_compression() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let salt = [0x42u8; 32];
+        let iv = [0x99u8; 12];
+        let pages =
+            encode_v2_with_kat(payload, &opts, &meta(), b"correct horse", &salt, &iv).unwrap();
+        assert_eq!(pages.len(), 1);
+        let recovered = v2_decode(&pages, &geometry, b"correct horse");
+        assert_eq!(recovered, payload);
+    }
+
+    /// v2 with bzip2 enabled: compress-then-encrypt round-trips
+    /// cleanly.
+    #[test]
+    fn v2_round_trip_compressed() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: true,
+            black: BLACK_PAPER,
+        };
+        let mut payload = Vec::new();
+        for _ in 0..50 {
+            payload.extend_from_slice(b"PaperBack archives bytes onto paper. ");
+        }
+        let salt = [0x11u8; 32];
+        let iv = [0x22u8; 12];
+        let pages =
+            encode_v2_with_kat(&payload, &opts, &meta(), b"swordfish", &salt, &iv).unwrap();
+        let recovered = v2_decode(&pages, &geometry, b"swordfish");
+        assert_eq!(recovered, payload);
+    }
+
+    /// v2 multi-page encode + decode in arbitrary page order.
+    #[test]
+    fn v2_round_trip_multi_page() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        // pagesize_v2 at this geometry: nstring=9 → 9*5*90 = 4050.
+        // 10000-byte payload + 16-byte tag = 10016 bytes ciphertext.
+        // ceil(10016/4050) = 3 pages.
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i * 31) as u8).collect();
+        let salt = [0xAAu8; 32];
+        let iv = [0xBBu8; 12];
+        let pages = encode_v2_with_kat(&payload, &opts, &meta(), b"long passphrase", &salt, &iv)
+            .unwrap();
+        assert!(pages.len() >= 3, "10000 bytes should require ≥3 v2 pages");
+        let recovered = v2_decode(&pages, &geometry, b"long passphrase");
+        assert_eq!(recovered, payload);
+    }
+
+    /// v2 with empty input: 0-byte plaintext → 16-byte ciphertext (just
+    /// the GCM tag) → still produces one decodable page. Pins the
+    /// edge case from FORMAT-V2.md §8.
+    #[test]
+    fn v2_round_trip_empty_input() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let salt = [0x55u8; 32];
+        let iv = [0x66u8; 12];
+        let pages = encode_v2_with_kat(b"", &opts, &meta(), b"empty test", &salt, &iv).unwrap();
+        assert_eq!(pages.len(), 1);
+        let recovered = v2_decode(&pages, &geometry, b"empty test");
+        assert!(recovered.is_empty());
+    }
+
+    /// v2 with the lowest and highest valid redundancy values.
+    #[test]
+    fn v2_round_trip_redundancy_min_and_max() {
+        let geometry = small_geometry();
+        let payload: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+        let salt = [0x77u8; 32];
+        let iv = [0x88u8; 12];
+        for r in [NGROUP_MIN, NGROUP_MAX] {
+            let opts = EncodeOptions {
+                geometry,
+                redundancy: r,
+                compress: false,
+                black: BLACK_PAPER,
+            };
+            let pages = encode_v2_with_kat(&payload, &opts, &meta(), b"pw", &salt, &iv).unwrap();
+            let recovered = v2_decode(&pages, &geometry, b"pw");
+            assert_eq!(recovered, payload, "redundancy = {r}");
+        }
+    }
+
+    /// Encode determinism: same (input, salt, iv, password, options)
+    /// produces byte-identical bitmaps. Pins the encode determinism
+    /// property from FORMAT-V2.md §1 design goal #5.
+    #[test]
+    fn v2_encode_with_fixed_kat_is_deterministic() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let payload = b"determinism test bytes";
+        let salt = [0x12u8; 32];
+        let iv = [0x34u8; 12];
+        let pages_a =
+            encode_v2_with_kat(payload, &opts, &meta(), b"key", &salt, &iv).unwrap();
+        let pages_b =
+            encode_v2_with_kat(payload, &opts, &meta(), b"key", &salt, &iv).unwrap();
+        assert_eq!(pages_a.len(), pages_b.len());
+        for (a, b) in pages_a.iter().zip(pages_b.iter()) {
+            assert_eq!(a.bitmap, b.bitmap, "v2 encode must be deterministic given fixed salt+iv");
+        }
+    }
+
+    /// Different IV → different ciphertext → different rendered
+    /// bitmap. Pins that the IV is actually plumbed through to GCM
+    /// (and not, say, getting swallowed somewhere in the encoder).
+    #[test]
+    fn v2_encode_different_iv_produces_different_bitmap() {
+        let geometry = small_geometry();
+        let opts = EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let payload = b"iv smoke test";
+        let salt = [0x12u8; 32];
+        let iv1 = [0x34u8; 12];
+        let iv2 = [0x35u8; 12];
+        let pages_1 =
+            encode_v2_with_kat(payload, &opts, &meta(), b"key", &salt, &iv1).unwrap();
+        let pages_2 =
+            encode_v2_with_kat(payload, &opts, &meta(), b"key", &salt, &iv2).unwrap();
+        assert_ne!(
+            pages_1[0].bitmap, pages_2[0].bitmap,
+            "different IV must produce different ciphertext"
+        );
+    }
+
+    /// pagesize_v2 helper math: cells - 2*redundancy - 3, divided by
+    /// (redundancy + 1), times redundancy * NDATA. Pin the formula
+    /// against accidental tweaks.
+    #[test]
+    fn pagesize_v2_matches_spec_formula() {
+        // Our small_geometry: 12x6 = 72 cells, redundancy=5.
+        // (72 - 10 - 3) / 6 = 59/6 = 9. Pagesize = 9*5*90 = 4050.
+        assert_eq!(pagesize_v2(72, 5), 4050);
+        // Larger geometry: 16x21 = 336 cells, redundancy=5.
+        // (336 - 10 - 3)/6 = 323/6 = 53. Pagesize = 53*5*90 = 23850.
+        assert_eq!(pagesize_v2(336, 5), 23850);
+        // Compare to v1 at same geometry: v1 pagesize is bigger by
+        // exactly (redundancy+1) NDATA-sized data slots... actually
+        // by 1 nstring's worth of data, since v2 loses 1 nstring per
+        // page to fit the 2nd super cell.
+        // v1 nstring at 12x6 r=5 = (72-5-2)/6 = 10. v2 nstring = 9.
+        // Difference in pagesize = 1 * 5 * 90 = 450 bytes.
+        let v1_pagesize = ((72 - 5 - 2) / 6) * 5 * 90u32;
+        assert_eq!(v1_pagesize - pagesize_v2(72, 5), 450);
     }
 
     #[test]

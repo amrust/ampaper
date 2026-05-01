@@ -26,8 +26,13 @@ use crate::block::{
     Block, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, PBM_ENCRYPTED, SuperBlock,
 };
 use crate::bz;
+use crate::format_v2::{
+    PBM_V2_COMPRESSED, PBM_V2_ENCRYPTED, V2_FEATURE_FLAGS_KNOWN, V2_FORMAT_VERSION, V2_GCM_TAG_LEN,
+    V2_SUPERBLOCK_ADDR_CELL1, V2_SUPERBLOCK_ADDR_CELL2, V2SuperBlockCell1, V2SuperBlockCell2,
+};
 use crate::legacy_aes;
 use crate::page::{self, PageGeometry};
+use crate::v2_crypto::{V2CryptoError, build_aad, decrypt_v2, derive_key_v2};
 
 /// Decoder configuration. Geometry must match what the encoder used
 /// to render each input page; reading a bitmap with the wrong dx /
@@ -93,6 +98,22 @@ pub enum DecodeError {
     /// means a block went missing in a way recovery couldn't fix
     /// and the resulting buffer is corrupt.
     BzipFailed(String),
+    /// v2 decode error from the AES-256-GCM layer (wrong password,
+    /// tampered ciphertext, tampered AAD, or truncated buffer).
+    V2DecryptFailed(V2CryptoError),
+    /// v2 cell 1 (file metadata) was found on at least one page but
+    /// no valid v2 cell 2 (crypto envelope) survived CRC across any
+    /// page. Without cell 2's KDF salt + GCM IV we cannot derive
+    /// the AES key.
+    IncompleteV2Header,
+    /// v2 cell 1's `format_version` field is not 2. Reserved for
+    /// future v3+ files this implementation cannot read.
+    UnsupportedFormatVersion { format_version: u8 },
+    /// v2 cell 1's `feature_flags` has bits set that this build
+    /// does not understand. Reserved bits are M12 features (color
+    /// encoding, adaptive RS, dot-shape, hex packing); a v2 file
+    /// with those bits set requires a newer ampaper to decode.
+    UnsupportedFeature { feature_flags: u8, unknown_bits: u8 },
 }
 
 impl core::fmt::Display for DecodeError {
@@ -116,6 +137,21 @@ impl core::fmt::Display for DecodeError {
             ),
             Self::DecryptFailed(e) => write!(f, "AES-CBC decrypt failed: {e}"),
             Self::BzipFailed(msg) => write!(f, "bzip2 decompression failed: {msg}"),
+            Self::V2DecryptFailed(e) => write!(f, "v2 AES-256-GCM decrypt failed: {e}"),
+            Self::IncompleteV2Header => f.write_str(
+                "v2 cell 1 found but no valid v2 cell 2; cannot derive key without salt+IV",
+            ),
+            Self::UnsupportedFormatVersion { format_version } => write!(
+                f,
+                "v2 cell 1 reports format_version={format_version}; this build only reads {V2_FORMAT_VERSION}"
+            ),
+            Self::UnsupportedFeature {
+                feature_flags,
+                unknown_bits,
+            } => write!(
+                f,
+                "v2 cell 1 sets unknown feature_flags bits {unknown_bits:#04x} (full flags {feature_flags:#04x}); requires a newer ampaper build"
+            ),
         }
     }
 }
@@ -149,7 +185,17 @@ pub fn decode(
     let threshold = options.threshold;
 
     // --- Steps 1-2: extract + CRC-filter cells ---------------------
+    // We classify each CRC-valid cell into one of:
+    //   - v1 SuperBlock (addr 0xFFFFFFFF)
+    //   - v2 cell 1 (addr 0xFFFFFFFE)
+    //   - v2 cell 2 (addr 0xFFFFFFFD)
+    //   - data block (addr < MAXSIZE, ngroup == 0)
+    //   - recovery block (ngroup in 2..=10)
+    // and dispatch to v1 or v2 reassembly based on which SuperBlock
+    // type wins. v2 cells take precedence — v2 is a forward format.
     let mut superblock: Option<SuperBlock> = None;
+    let mut v2_cell1: Option<V2SuperBlockCell1> = None;
+    let mut v2_cell2: Option<V2SuperBlockCell2> = None;
     let mut data_blocks: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
     let mut recovery_blocks: Vec<(u32, u8, [u8; NDATA])> = Vec::new(); // (offset, ngroup, data)
     let mut metadata_inconsistency = false;
@@ -159,6 +205,22 @@ pub fn decode(
         for cell in cells {
             let block = Block::from_bytes(&cell);
             if !block.verify_crc() {
+                continue;
+            }
+            // v2 SuperBlock cells: discriminate by the addr sentinel
+            // before falling through to is_super / is_data / is_recovery.
+            if block.addr == V2_SUPERBLOCK_ADDR_CELL1 {
+                let parsed = V2SuperBlockCell1::from_data_bytes(&block.data);
+                if v2_cell1.is_none() {
+                    v2_cell1 = Some(parsed);
+                }
+                continue;
+            }
+            if block.addr == V2_SUPERBLOCK_ADDR_CELL2 {
+                let parsed = V2SuperBlockCell2::from_data_bytes(&block.data);
+                if v2_cell2.is_none() {
+                    v2_cell2 = Some(parsed);
+                }
                 continue;
             }
             if block.is_super() {
@@ -193,6 +255,14 @@ pub fn decode(
                 }
             }
         }
+    }
+
+    // v2 takes precedence: if we found a v2 cell 1, dispatch to v2.
+    // Pass cell2 through as Option so decode_v2 can validate cell1
+    // BEFORE complaining about missing cell2 — UnsupportedFeature on
+    // a forward-format file should win over IncompleteV2Header.
+    if let Some(cell1) = v2_cell1 {
+        return decode_v2(cell1, v2_cell2, &data_blocks, &recovery_blocks, password);
     }
 
     if metadata_inconsistency {
@@ -323,6 +393,154 @@ pub fn decode(
     }
     buf.truncate(superblock.origsize as usize);
     Ok(buf)
+}
+
+/// v2 reassembly + decryption. Called from `decode` when v2 cells are
+/// detected on the input pages. Spec: docs/FORMAT-V2.md §4.2.
+///
+/// Pipeline:
+///   1. Validate cell 1 (`format_version`, `feature_flags`).
+///   2. Reassemble the ciphertext-with-tag buffer of size `datasize`
+///      from the data blocks; XOR-recover any group missing exactly
+///      one block.
+///   3. Build AAD from cell 1's structural fields.
+///   4. Decrypt via AES-256-GCM with key = PBKDF2(password, kdf_salt).
+///   5. If `feature_flags & PBM_V2_COMPRESSED`, bzip2-decompress.
+///   6. Truncate to `origsize`.
+fn decode_v2(
+    cell1: V2SuperBlockCell1,
+    cell2: Option<V2SuperBlockCell2>,
+    data_blocks: &std::collections::BTreeMap<u32, [u8; NDATA]>,
+    recovery_blocks: &[(u32, u8, [u8; NDATA])],
+    password: Option<&[u8]>,
+) -> Result<Vec<u8>, DecodeError> {
+    // --- Step 1: validate cell 1 -----------------------------------
+    // Cell 1 validation MUST run before we require cell 2 — a v3 file
+    // (or a v2 file with reserved feature_flags bits) should surface
+    // a forward-format error rather than IncompleteV2Header even if
+    // its cell 2 happens to also be missing on a damaged scan.
+    if cell1.format_version != V2_FORMAT_VERSION {
+        return Err(DecodeError::UnsupportedFormatVersion {
+            format_version: cell1.format_version,
+        });
+    }
+    let unknown_bits = cell1.feature_flags & !V2_FEATURE_FLAGS_KNOWN;
+    if unknown_bits != 0 {
+        return Err(DecodeError::UnsupportedFeature {
+            feature_flags: cell1.feature_flags,
+            unknown_bits,
+        });
+    }
+    if cell1.feature_flags & PBM_V2_ENCRYPTED == 0 {
+        // Current spec only writes encrypted v2 (the whole point of
+        // v2 is the AEAD envelope; unencrypted output stays on the v1
+        // wire). A future ampaper might introduce unencrypted v2 for
+        // pure forward-format use; until then, reject loudly.
+        return Err(DecodeError::UnsupportedFeature {
+            feature_flags: cell1.feature_flags,
+            unknown_bits: PBM_V2_ENCRYPTED,
+        });
+    }
+    let cell2 = cell2.ok_or(DecodeError::IncompleteV2Header)?;
+    let password = password.ok_or(DecodeError::PasswordRequired)?;
+
+    // --- Step 2: reassemble ciphertext + tag buffer ----------------
+    let datasize = cell1.datasize;
+    let mut buf = vec![0u8; datasize as usize];
+    let mut filled = vec![false; (datasize.div_ceil(NDATA as u32)) as usize];
+    for (&offset, data) in data_blocks {
+        if offset >= datasize {
+            continue;
+        }
+        let off = offset as usize;
+        let copy_len = NDATA.min(buf.len() - off);
+        buf[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+        let block_index = off / NDATA;
+        if block_index < filled.len() {
+            filled[block_index] = true;
+        }
+    }
+
+    // XOR-checksum recovery: same algebra as the v1 path. Pulling
+    // this out as a shared helper would be nice cleanup but is M11+1
+    // work; for now we duplicate the loop to keep the v2 changeset
+    // self-contained.
+    for (recovery_offset, ngroup, recovery_data) in recovery_blocks {
+        let group_size = *ngroup as usize;
+        let group_start = *recovery_offset as usize;
+        let group_first_block = group_start / NDATA;
+        if group_first_block + group_size > filled.len() {
+            continue;
+        }
+        let mut missing_count = 0usize;
+        let mut missing_idx = 0usize;
+        for k in 0..group_size {
+            let bi = group_first_block + k;
+            if !filled[bi] {
+                missing_count += 1;
+                missing_idx = bi;
+            }
+        }
+        if missing_count != 1 {
+            continue;
+        }
+        let mut recovered = *recovery_data;
+        for r in &mut recovered {
+            *r ^= 0xFF;
+        }
+        for k in 0..group_size {
+            let bi = group_first_block + k;
+            if bi == missing_idx {
+                continue;
+            }
+            let off = bi * NDATA;
+            let end = (off + NDATA).min(buf.len());
+            if end <= off {
+                continue;
+            }
+            for (r, &b) in recovered.iter_mut().zip(buf[off..end].iter()) {
+                *r ^= b;
+            }
+        }
+        let off = missing_idx * NDATA;
+        let copy_len = NDATA.min(buf.len().saturating_sub(off));
+        buf[off..off + copy_len].copy_from_slice(&recovered[..copy_len]);
+        filled[missing_idx] = true;
+    }
+    for (i, &ok) in filled.iter().enumerate() {
+        if !ok {
+            return Err(DecodeError::UnrecoverableGap {
+                offset: (i * NDATA) as u32,
+            });
+        }
+    }
+
+    // --- Step 3-4: build AAD, derive key, decrypt ------------------
+    let aad = build_aad(
+        cell1.feature_flags,
+        cell1.page_count,
+        cell1.origsize,
+        cell1.datasize,
+    );
+    let key = derive_key_v2(password, &cell2.kdf_salt);
+    let mut plaintext =
+        decrypt_v2(&key, &cell2.gcm_iv, &aad, &buf).map_err(|e| match e {
+            V2CryptoError::InvalidPassword => DecodeError::InvalidPassword,
+            other => DecodeError::V2DecryptFailed(other),
+        })?;
+    // After AES-GCM, plaintext.len() == buf.len() - V2_GCM_TAG_LEN.
+    debug_assert_eq!(
+        plaintext.len() + V2_GCM_TAG_LEN,
+        buf.len(),
+        "GCM plaintext length should equal ciphertext length minus tag"
+    );
+
+    // --- Step 5-6: optional decompress + truncate to origsize ------
+    if cell1.feature_flags & PBM_V2_COMPRESSED != 0 {
+        plaintext = bz::decompress(&plaintext).map_err(|e| DecodeError::BzipFailed(e.to_string()))?;
+    }
+    plaintext.truncate(cell1.origsize as usize);
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -666,5 +884,221 @@ mod tests {
         };
         let err = decode(&[bitmap], &opts, Some(b"wrong password")).unwrap_err();
         assert_eq!(err, DecodeError::InvalidPassword);
+    }
+
+    // === v2 decode error-path tests (M11) ====================
+    //
+    // Round-trip success cases live in encoder.rs alongside the
+    // encode_v2 entry points; these tests exercise the decoder's
+    // error surface (PasswordRequired, InvalidPassword,
+    // UnsupportedFormatVersion, UnsupportedFeature,
+    // IncompleteV2Header).
+
+    fn v2_pages(
+        payload: &[u8],
+        password: &[u8],
+        salt: &[u8; 32],
+        iv: &[u8; 12],
+    ) -> (Vec<Vec<u8>>, page::PageGeometry) {
+        let geometry = small_geometry();
+        let opts = crate::encoder::EncodeOptions {
+            geometry,
+            redundancy: 5,
+            compress: false,
+            black: page::BLACK_PAPER,
+        };
+        let pages = crate::encoder::encode_v2_with_kat(payload, &opts, &meta(), password, salt, iv)
+            .expect("encode_v2 must succeed in tests");
+        let bitmaps: Vec<Vec<u8>> = pages.iter().map(|p| p.bitmap.clone()).collect();
+        (bitmaps, geometry)
+    }
+
+    /// v2 page decoded without password → PasswordRequired.
+    #[test]
+    fn v2_no_password_is_password_required() {
+        let salt = [0x42u8; 32];
+        let iv = [0x99u8; 12];
+        let (pages, geometry) = v2_pages(b"hello", b"correct horse", &salt, &iv);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&pages, &opts, None).unwrap_err();
+        assert_eq!(err, DecodeError::PasswordRequired);
+    }
+
+    /// v2 page decoded with wrong password → InvalidPassword.
+    #[test]
+    fn v2_wrong_password_is_invalid_password() {
+        let salt = [0x42u8; 32];
+        let iv = [0x99u8; 12];
+        let (pages, geometry) = v2_pages(b"hello", b"correct horse", &salt, &iv);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&pages, &opts, Some(b"wrong password")).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidPassword);
+    }
+
+    /// Decoder rejects v2 cell 1 with reserved (M12) feature_flags
+    /// bits set. Pins forward-compat: a future ampaper that adds bit
+    /// 2 (color) emits files this version of ampaper refuses cleanly.
+    #[test]
+    fn v2_unknown_feature_flags_is_unsupported_feature() {
+        use crate::block::{Block, ECC_BYTES};
+        use crate::format_v2::V2SuperBlockCell1;
+
+        // Build a v2 page with a synthetic cell 1 carrying a reserved
+        // bit (bit 2 = future color encoding).
+        let geometry = small_geometry();
+        let mut name = [0u8; 64];
+        name[..4].copy_from_slice(b"test");
+        let cell1 = V2SuperBlockCell1 {
+            format_version: 2,
+            feature_flags: 0b0000_0111, // bit 0 + bit 1 + reserved bit 2
+            page: 1,
+            page_count: 1,
+            datasize: 16,
+            origsize: 0,
+            pagesize: 16,
+            modified: 0,
+            name,
+        };
+        let cell1_block = cell1.to_block();
+
+        // Synthesize a page bitmap with cell 1 placed at cell index 0.
+        // The decoder's classification by addr fires regardless of
+        // whether we have a valid cell 2 — UnsupportedFeature must
+        // win before IncompleteV2Header.
+        let mut placed = vec![page::PlacedBlock {
+            cell_index: 0,
+            bytes: cell1_block.to_bytes(),
+        }];
+        // Fill remaining cells with dummy blocks so the bitmap renders.
+        let dummy = Block {
+            addr: 0,
+            data: [0u8; NDATA],
+            crc: 0,
+            ecc: [0u8; ECC_BYTES],
+        };
+        let total_cells = geometry.nx() * geometry.ny();
+        for cell in 1..total_cells {
+            placed.push(page::PlacedBlock {
+                cell_index: cell,
+                bytes: dummy.to_bytes(),
+            });
+        }
+        let bitmap = page::render(&geometry, &placed, page::BLACK_PAPER);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&[bitmap], &opts, Some(b"pw")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::UnsupportedFeature {
+                    unknown_bits: 0b100,
+                    ..
+                }
+            ),
+            "expected UnsupportedFeature with bit 2 set, got {err:?}"
+        );
+    }
+
+    /// Decoder rejects v2 cell 1 with a wrong format_version.
+    #[test]
+    fn v2_unsupported_format_version_is_rejected() {
+        use crate::block::{Block, ECC_BYTES};
+        use crate::format_v2::V2SuperBlockCell1;
+
+        let geometry = small_geometry();
+        let cell1 = V2SuperBlockCell1 {
+            format_version: 99, // not 2
+            feature_flags: PBM_V2_ENCRYPTED,
+            page: 1,
+            page_count: 1,
+            datasize: 16,
+            origsize: 0,
+            pagesize: 16,
+            modified: 0,
+            name: [0; 64],
+        };
+        let cell1_block = cell1.to_block();
+        let mut placed = vec![page::PlacedBlock {
+            cell_index: 0,
+            bytes: cell1_block.to_bytes(),
+        }];
+        let dummy = Block {
+            addr: 0,
+            data: [0u8; NDATA],
+            crc: 0,
+            ecc: [0u8; ECC_BYTES],
+        };
+        let total_cells = geometry.nx() * geometry.ny();
+        for cell in 1..total_cells {
+            placed.push(page::PlacedBlock {
+                cell_index: cell,
+                bytes: dummy.to_bytes(),
+            });
+        }
+        let bitmap = page::render(&geometry, &placed, page::BLACK_PAPER);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&[bitmap], &opts, Some(b"pw")).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::UnsupportedFormatVersion { format_version: 99 }
+        );
+    }
+
+    /// v2 cell 1 present but no v2 cell 2 → IncompleteV2Header. The
+    /// decoder needs cell 2 for the KDF salt + GCM IV; without it,
+    /// no key derivation is possible.
+    #[test]
+    fn v2_missing_cell2_is_incomplete_header() {
+        use crate::block::{Block, ECC_BYTES};
+        use crate::format_v2::V2SuperBlockCell1;
+
+        let geometry = small_geometry();
+        let cell1 = V2SuperBlockCell1 {
+            format_version: 2,
+            feature_flags: PBM_V2_ENCRYPTED,
+            page: 1,
+            page_count: 1,
+            datasize: 16,
+            origsize: 0,
+            pagesize: 16,
+            modified: 0,
+            name: [0; 64],
+        };
+        let cell1_block = cell1.to_block();
+        let mut placed = vec![page::PlacedBlock {
+            cell_index: 0,
+            bytes: cell1_block.to_bytes(),
+        }];
+        let dummy = Block {
+            addr: 0,
+            data: [0u8; NDATA],
+            crc: 0,
+            ecc: [0u8; ECC_BYTES],
+        };
+        let total_cells = geometry.nx() * geometry.ny();
+        for cell in 1..total_cells {
+            placed.push(page::PlacedBlock {
+                cell_index: cell,
+                bytes: dummy.to_bytes(),
+            });
+        }
+        let bitmap = page::render(&geometry, &placed, page::BLACK_PAPER);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&[bitmap], &opts, Some(b"pw")).unwrap_err();
+        assert_eq!(err, DecodeError::IncompleteV2Header);
     }
 }
