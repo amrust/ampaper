@@ -10,4 +10,5 @@ pub mod bz;
 pub mod crc;
 pub mod dot_grid;
 pub mod ecc;
+pub mod encoder;
 pub mod page;
