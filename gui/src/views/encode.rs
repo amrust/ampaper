@@ -23,12 +23,13 @@ use ampaper::block::{NGROUP_DEFAULT, NGROUP_MAX, NGROUP_MIN};
 use ampaper::encoder::EncodeOptions;
 use ampaper::page::{BLACK_PAPER, PageGeometry};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::worker::{EncodeJob, EncodeMessage, EncodeRequest};
 
 /// Paper-size preset for the geometry section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaperSize {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaperSize {
     UsLetter,
     A4,
 }
@@ -51,24 +52,50 @@ impl PaperSize {
     }
 }
 
-/// The state for the encode tab. Owns no codec state directly — only
-/// UI inputs and the worker channel when a job is running.
-pub struct EncodeView {
-    input_path: Option<PathBuf>,
-    output_dir: Option<PathBuf>,
-    paper_size: PaperSize,
+/// Encoder settings that persist across sessions. Excludes session-
+/// only state (file paths, password, worker handle, results). Saved
+/// to disk via eframe's persistence layer; hydrated at app launch.
+/// Defaults match mrpods / PaperBack 1.10 (memory/mrpods_defaults.md).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncodeSettings {
+    pub paper_size: PaperSize,
     /// Printer DPI. PB 1.10 default is 600 (most consumer lasers).
-    printer_dpi: u32,
+    pub printer_dpi: u32,
     /// Blocks-per-inch. PB 1.10 default is 200.
-    blocks_per_inch: u32,
+    pub blocks_per_inch: u32,
     /// Dot fill percentage. PB 1.10 default is 70. Stored as u8 to
     /// match `PageGeometry::dot_percent`.
-    dot_percent: u8,
-    redundancy: u8,
-    compress: bool,
-    v2_encrypt: bool,
-    v2_password: String,
+    pub dot_percent: u8,
+    pub redundancy: u8,
+    pub compress: bool,
+    /// "Default to v2 encryption" — controls the checkbox state when
+    /// the Encode tab opens. The password itself is NEVER persisted
+    /// (security: an archival utility shouldn't tempt users into
+    /// keeping passwords in plaintext config).
+    pub v2_encrypt: bool,
+}
 
+impl Default for EncodeSettings {
+    fn default() -> Self {
+        Self {
+            paper_size: PaperSize::UsLetter,
+            printer_dpi: 600,
+            blocks_per_inch: 200,
+            dot_percent: 70,
+            redundancy: NGROUP_DEFAULT,
+            compress: true,
+            v2_encrypt: false,
+        }
+    }
+}
+
+/// The state for the encode tab. Persisted defaults live in
+/// `settings`; everything else is session-only.
+pub struct EncodeView {
+    pub settings: EncodeSettings,
+    input_path: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    v2_password: String,
     /// Active worker, if any.
     job: Option<EncodeJob>,
     /// Latest status message from the worker (or last result/error).
@@ -79,16 +106,16 @@ pub struct EncodeView {
 
 impl Default for EncodeView {
     fn default() -> Self {
+        Self::with_settings(EncodeSettings::default())
+    }
+}
+
+impl EncodeView {
+    pub fn with_settings(settings: EncodeSettings) -> Self {
         Self {
+            settings,
             input_path: None,
             output_dir: None,
-            paper_size: PaperSize::UsLetter,
-            printer_dpi: 600,
-            blocks_per_inch: 200,
-            dot_percent: 70,
-            redundancy: NGROUP_DEFAULT,
-            compress: true,
-            v2_encrypt: false,
             v2_password: String::new(),
             job: None,
             last_status: String::new(),
@@ -99,6 +126,12 @@ impl Default for EncodeView {
 
 impl EncodeView {
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // Drag-and-drop: take the FIRST dropped file as the input.
+        // Encode is single-input by definition (one file → bitmaps),
+        // so multi-drop is fine but only the first file is used. UX
+        // mirrors the Decode tab.
+        self.poll_dropped_files(ui.ctx());
+
         // Drain any pending worker messages first so the UI shown
         // this frame reflects the latest state.
         self.drain_worker();
@@ -155,7 +188,7 @@ impl EncodeView {
                 .input_path
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(none)".to_string());
+                .unwrap_or_else(|| "(drop a file here, or use the button)".to_string());
             ui.monospace(display);
         });
         ui.horizontal(|ui| {
@@ -197,43 +230,43 @@ impl EncodeView {
     fn show_options(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Geometry").strong());
         egui::ComboBox::from_label("Paper size")
-            .selected_text(self.paper_size.label())
+            .selected_text(self.settings.paper_size.label())
             .show_ui(ui, |ui| {
                 for size in [PaperSize::UsLetter, PaperSize::A4] {
-                    ui.selectable_value(&mut self.paper_size, size, size.label());
+                    ui.selectable_value(&mut self.settings.paper_size, size, size.label());
                 }
             });
         ui.horizontal(|ui| {
             ui.label("Printer DPI:");
-            ui.add(egui::DragValue::new(&mut self.printer_dpi).range(150..=2400));
+            ui.add(egui::DragValue::new(&mut self.settings.printer_dpi).range(150..=2400));
         });
         ui.horizontal(|ui| {
             ui.label("Blocks per inch:");
-            ui.add(egui::DragValue::new(&mut self.blocks_per_inch).range(50..=400));
+            ui.add(egui::DragValue::new(&mut self.settings.blocks_per_inch).range(50..=400));
         });
         ui.horizontal(|ui| {
             ui.label("Dot fill (%):");
-            ui.add(egui::Slider::new(&mut self.dot_percent, 30..=95));
+            ui.add(egui::Slider::new(&mut self.settings.dot_percent, 30..=95));
         });
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Redundancy").strong());
         ui.horizontal(|ui| {
             ui.label("Recovery group size:");
             ui.add(egui::Slider::new(
-                &mut self.redundancy,
+                &mut self.settings.redundancy,
                 NGROUP_MIN..=NGROUP_MAX,
             ));
         });
-        ui.checkbox(&mut self.compress, "bzip2-compress before encoding");
+        ui.checkbox(&mut self.settings.compress, "bzip2-compress before encoding");
     }
 
     fn show_v2_section(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Encryption (v2)").strong());
         ui.checkbox(
-            &mut self.v2_encrypt,
+            &mut self.settings.v2_encrypt,
             "Encrypt with AES-256-GCM (emit v2 format)",
         );
-        if self.v2_encrypt {
+        if self.settings.v2_encrypt {
             ui.horizontal(|ui| {
                 ui.label("Password:");
                 ui.add(
@@ -256,7 +289,7 @@ impl EncodeView {
     fn show_encode_button(&mut self, ui: &mut egui::Ui) {
         let ready = self.input_path.is_some()
             && self.output_dir.is_some()
-            && (!self.v2_encrypt || !self.v2_password.is_empty());
+            && (!self.settings.v2_encrypt || !self.v2_password.is_empty());
         ui.add_enabled_ui(ready, |ui| {
             if ui.button("Encode").clicked()
                 && let Some(req) = self.build_request()
@@ -287,25 +320,25 @@ impl EncodeView {
             .and_then(|s| s.to_str())
             .unwrap_or("ampaper")
             .to_string();
-        let (in_w, in_h) = self.paper_size.inches();
-        let width = (in_w * self.printer_dpi as f32) as u32;
-        let height = (in_h * self.printer_dpi as f32) as u32;
+        let (in_w, in_h) = self.settings.paper_size.inches();
+        let width = (in_w * self.settings.printer_dpi as f32) as u32;
+        let height = (in_h * self.settings.printer_dpi as f32) as u32;
         let geometry = PageGeometry {
-            ppix: self.printer_dpi,
-            ppiy: self.printer_dpi,
-            dpi: self.blocks_per_inch,
-            dot_percent: self.dot_percent,
+            ppix: self.settings.printer_dpi,
+            ppiy: self.settings.printer_dpi,
+            dpi: self.settings.blocks_per_inch,
+            dot_percent: self.settings.dot_percent,
             width,
             height,
             print_border: false,
         };
         let options = EncodeOptions {
             geometry,
-            redundancy: self.redundancy,
-            compress: self.compress,
+            redundancy: self.settings.redundancy,
+            compress: self.settings.compress,
             black: BLACK_PAPER,
         };
-        let v2_password = if self.v2_encrypt {
+        let v2_password = if self.settings.v2_encrypt {
             Some(self.v2_password.clone())
         } else {
             None
@@ -317,6 +350,27 @@ impl EncodeView {
             options,
             v2_password,
         })
+    }
+
+    fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        // Only consume drops when we're not mid-encode AND have
+        // nothing already queued the user might be looking at — drag
+        // is a "set this up" gesture, not a "redo it" one.
+        if self.job.is_some() {
+            return;
+        }
+        let dropped: Option<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .find_map(|f| f.path.clone())
+        });
+        if let Some(path) = dropped {
+            if self.output_dir.is_none() {
+                self.output_dir = path.parent().map(|p| p.to_path_buf());
+            }
+            self.input_path = Some(path);
+        }
     }
 
     fn drain_worker(&mut self) {

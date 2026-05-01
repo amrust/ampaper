@@ -31,6 +31,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ampaper",
         options,
-        Box::new(|_cc| Ok(Box::new(AmpaperApp::default()))),
+        Box::new(|cc| Ok(Box::new(AmpaperApp::new(cc)))),
     )
 }

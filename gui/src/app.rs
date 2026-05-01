@@ -6,6 +6,7 @@
 // channel handle when one is running).
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::views;
 
@@ -15,7 +16,7 @@ use crate::views;
 /// Encode / Decode / Settings are always functional. Print and
 /// "Scan from device" are platform-gated (Windows-only at M9 / M10)
 /// and render a "not yet available" placeholder elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tab {
     Encode,
     Decode,
@@ -58,6 +59,20 @@ pub struct AmpaperApp {
     pub settings: views::settings::SettingsView,
 }
 
+/// Subset of [`AmpaperApp`] state that round-trips through eframe's
+/// persistence layer (RON-serialized blob in `%APPDATA%\ampaper\` etc.).
+/// Excludes everything session-only: file paths, passwords, worker
+/// handles, status messages.
+///
+/// This struct is the single point of contact for "what's saved."
+/// Adding a field requires two edits: declare it here and wire it in
+/// `AmpaperApp::new` / `AmpaperApp::save`.
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedState {
+    last_tab: Option<Tab>,
+    encode_settings: views::encode::EncodeSettings,
+}
+
 impl Default for AmpaperApp {
     fn default() -> Self {
         Self {
@@ -69,7 +84,34 @@ impl Default for AmpaperApp {
     }
 }
 
+impl AmpaperApp {
+    /// Construct from an [`eframe::CreationContext`], hydrating any
+    /// persisted state. Falls back to defaults when no storage entry
+    /// exists or deserialization fails (e.g., schema drift between
+    /// ampaper versions — fail open, not loud).
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let persisted: PersistedState = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
+            .unwrap_or_default();
+        Self {
+            tab: persisted.last_tab.unwrap_or(Tab::Encode),
+            encode: views::encode::EncodeView::with_settings(persisted.encode_settings),
+            decode: Default::default(),
+            settings: Default::default(),
+        }
+    }
+}
+
 impl eframe::App for AmpaperApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let state = PersistedState {
+            last_tab: Some(self.tab),
+            encode_settings: self.encode.settings.clone(),
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &state);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Left navigation rail. Fixed width so the central content
         // doesn't reflow when tab labels change (or when a long
@@ -126,6 +168,11 @@ impl eframe::App for AmpaperApp {
             Tab::Print => views::stubs::show_print_stub(ui),
             Tab::ScanDevice => views::stubs::show_scan_device_stub(ui),
         });
+
+        // Drain any per-tab signals raised this frame.
+        if std::mem::take(&mut self.settings.reset_requested) {
+            self.encode.settings = views::encode::EncodeSettings::default();
+        }
     }
 }
 

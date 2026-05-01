@@ -37,7 +37,15 @@ eframe = { version = "0.34", default-features = false, features = [
     "glow",
     "wayland",
     "x11",
+    # Pulls in ron + serde so eframe::set_value / eframe::get_value
+    # can round-trip our PersistedState through OS-standard config
+    # paths (%APPDATA%\ampaper on Windows, ~/.local/share/ampaper on
+    # Linux, ~/Library/Application Support/ampaper on macOS).
+    # Used by ampaperApp::save / ::new for window state + Encode tab
+    # defaults across sessions.
+    "persistence",
 ] }
+serde = { version = "1", features = ["derive"] }
 
 # Native file-pick / save dialogs. rfd wraps Win32 IFileDialog,
 # macOS NSOpenPanel, and Linux portal-or-zenity — same `pick_file`
