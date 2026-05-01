@@ -1,0 +1,29 @@
+[package]
+name = "ampaper-gui"
+version = "0.0.1"
+edition = "2024"
+description = "egui front-end for the ampaper Rust port of PaperBack"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/amrust/ampaper"
+authors = ["ampaper contributors"]
+rust-version = "1.85"
+
+[dependencies]
+# The codec lives in the sibling crate. GUI imports it as a normal
+# dep — no feature-flag dance, the GUI crate is the only place
+# eframe / wgpu / winit show up.
+ampaper = { path = ".." }
+
+# eframe = the native (and web) wrapper around egui. Pulls in winit
+# for windowing + wgpu for rendering on all three platforms. Pure-
+# Rust dep tree; no GTK / Qt / WebView. See
+# memory/gui_stack_decision.md for why.
+eframe = { version = "0.34", default-features = false, features = [
+    "default_fonts",  # bundle Latin + Hiragino Sans fallback
+    "wgpu",           # native rendering backend; works on Win/Mac/Linux
+] }
+
+# Convenience for spawning blocking codec jobs onto a worker thread.
+# eframe's `Context::request_repaint_after` lets us drive UI updates
+# from the worker thread without polling.
+# (No tokio yet — encode/decode are CPU-bound, std::thread is enough.)

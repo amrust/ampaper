@@ -1,3 +1,11 @@
+[workspace]
+# The codec crate (this Cargo.toml's [package]) is platform-agnostic;
+# the GUI crate sits in `gui/` so eframe / winit / wgpu deps don't
+# leak into the lib's dep tree. Print + scan binaries (M9 / M10) will
+# join as additional workspace members behind cfg(windows).
+members = ["gui"]
+resolver = "3"
+
 [package]
 name = "ampaper"
 version = "0.0.1"
