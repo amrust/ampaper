@@ -15,11 +15,14 @@ Each vector is **two or three files** sharing a base name:
 ```
 <name>.input          Raw bytes fed into PaperBack 1.10's encoder.
                       May be any size up to MAXSIZE (256 MB minus 128).
-<name>.bmp            PaperBack 1.10's encoder output. Captured via the
+<name>.bmp / .png     PaperBack 1.10's encoder output. Captured via the
                       "save to BMP" debug path: in PB 1.10's GUI choose
                       "File → Save bitmap…" instead of "File → Print",
                       or pass a non-empty `outbmp` to `Printfile()` if
                       driving programmatically. See FORMAT-V1.md §8.
+                      A 1500x1500 grayscale BMP is ~26 MB; converting
+                      to PNG losslessly drops that to ~100 KB and is
+                      strongly preferred for committed vectors.
 <name>.txt            (Recommended) Capture metadata in plain text:
                         - PaperBack version + checksum of the binary used
                         - Encoder options (dpi, dotpercent, redundancy,
@@ -27,6 +30,11 @@ Each vector is **two or three files** sharing a base name:
                         - Date captured + capturer's notes
                       Read once; never asserted against.
 ```
+
+For paper-print captures (printed page scanned back at ≥ 900 DPI),
+use the `.scan.png` suffix and a separate `scanned/` subdirectory —
+those exercise different code paths than synthetic bitmaps and are
+harder to reproduce, so they're tracked separately.
 
 For multi-page captures (input larger than one page), PaperBack 1.10
 emits one BMP per page named `<base>_NNNN.bmp`. Keep them all under the
@@ -57,9 +65,49 @@ is just a stable way to surface a mismatch without diffing megabytes of
 binary in test output. Tests should print `sha256(recovered)` and
 `sha256(input)` on failure for that reason.
 
-## Recommended initial vectors
+## Recommended encoder settings
 
-When the first batch is captured, aim for diversity across these axes:
+Use PaperBack 1.10's (and mrpods's) **source defaults** unless a
+vector deliberately tests off-default options. These values are the
+empirical sweet spot for max-data-per-page-without-too-many-errors —
+they were iterated on during mrpods development and are baked into
+both source trees identically:
+
+```
+dpi (Raster)         = 200
+dotpercent (Dot size) = 70
+compression          = 2 (Maximum)
+redundancy           = 5
+print_border         = 0 (off)
+print_header         = 1 (on)
+margin units         = 1/1000 inch
+margin left          = 1000  (1.0 inch)
+margin right         = 400   (0.4 inch)
+margin top           = 400   (0.4 inch)
+margin bottom        = 500   (0.5 inch)
+```
+
+Record the actual values used per vector in the `<name>.txt` file
+so future readers can reproduce.
+
+## Starter vectors in this directory
+
+| File | Content | Size |
+|---|---|---|
+| `lorem.input` | Standard 5-sentence Lorem Ipsum (English) | 446 bytes |
+
+Capture workflow for the lorem vector:
+1. Open `lorem.input` in PaperBack 1.10
+2. Use the source defaults from above
+3. File → Save bitmap → `lorem.bmp`
+4. Convert to PNG (any tool — `magick lorem.bmp lorem.png`)
+5. Drop a `lorem.txt` with the encoder options and PB 1.10 version
+6. Commit `lorem.png` and `lorem.txt` (the `.bmp` is too large to
+   commit and we don't need it once PNG is saved)
+
+## Future vector matrix
+
+Beyond the lorem starter, expand coverage along these axes:
 
 | Axis | Variants worth one vector each |
 |---|---|
@@ -79,10 +127,8 @@ When the first batch is captured, aim for diversity across these axes:
   public artifacts in a public repo. Use synthetic / public-domain
   inputs only (lorem ipsum, a Project Gutenberg excerpt, `/dev/urandom`
   output committed alongside as the .input).
-- `.scan.bmp` / `.scan.png` files (a printed-then-scanned capture
-  rather than the encoder's BMP-debug output). Those are harder to
-  reproduce deterministically and belong in a separate `scanned/`
-  subdirectory if/when we add scan-decode tests.
+- Raw `.bmp` files when a PNG conversion exists — BMPs at typical
+  page sizes are 25+ MB; PNGs of the same content are ~100 KB.
 
 ## Why this directory ships in the public repo
 
