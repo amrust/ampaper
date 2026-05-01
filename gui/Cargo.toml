@@ -48,7 +48,7 @@ rfd = "0.17"
 # Encode the raw grayscale Vec<u8> the codec produces into BMP/PNG
 # files for the user to save. The lib already pulls in `image` as a
 # dev-dep for golden-vector tests; here it's a real runtime dep.
-image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "jpeg"] }
 
 # Convenience for spawning blocking codec jobs onto a worker thread.
 # eframe's `Context::request_repaint_after` lets us drive UI updates

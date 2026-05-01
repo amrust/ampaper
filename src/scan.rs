@@ -934,8 +934,13 @@ pub fn scan_decode(
         Block, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, PBM_ENCRYPTED, SuperBlock,
     };
     use crate::decoder::DecodeError;
+    use crate::format_v2::{
+        V2_SUPERBLOCK_ADDR_CELL1, V2_SUPERBLOCK_ADDR_CELL2, V2SuperBlockCell1, V2SuperBlockCell2,
+    };
 
     let mut superblock: Option<SuperBlock> = None;
+    let mut v2_cell1: Option<V2SuperBlockCell1> = None;
+    let mut v2_cell2: Option<V2SuperBlockCell2> = None;
     let mut data_blocks: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
     let mut recovery_blocks: Vec<(u32, u8, [u8; NDATA])> = Vec::new();
     let mut metadata_inconsistency = false;
@@ -947,6 +952,22 @@ pub fn scan_decode(
         for cell in cells {
             let block = Block::from_bytes(&cell);
             if !block.verify_crc() {
+                continue;
+            }
+            // v2 SuperBlock cells discriminate by addr sentinel —
+            // mirrors the dispatch in crate::decoder::decode so a v2
+            // BMP scanned and decoded via this path produces the same
+            // result as one decoded with known geometry.
+            if block.addr == V2_SUPERBLOCK_ADDR_CELL1 {
+                if v2_cell1.is_none() {
+                    v2_cell1 = Some(V2SuperBlockCell1::from_data_bytes(&block.data));
+                }
+                continue;
+            }
+            if block.addr == V2_SUPERBLOCK_ADDR_CELL2 {
+                if v2_cell2.is_none() {
+                    v2_cell2 = Some(V2SuperBlockCell2::from_data_bytes(&block.data));
+                }
                 continue;
             }
             if block.is_super() {
@@ -978,6 +999,17 @@ pub fn scan_decode(
                 }
             }
         }
+    }
+
+    // v2 takes precedence over v1 — same rule as crate::decoder::decode.
+    if let Some(cell1) = v2_cell1 {
+        return crate::decoder::decode_v2(
+            cell1,
+            v2_cell2,
+            &data_blocks,
+            &recovery_blocks,
+            password,
+        );
     }
 
     if metadata_inconsistency {
@@ -1329,6 +1361,32 @@ mod tests {
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
         let (bitmap, w, h) = encode_payload(&payload);
         let recovered = scan_decode(&[(&bitmap, w, h)], None).unwrap();
+        assert_eq!(recovered, payload);
+    }
+
+    /// scan_decode dispatches to the v2 path when a v2 cell 1 shows
+    /// up among the recovered cells. Pins the M11/M8 contract that
+    /// dragging a v2-encoded BMP onto the GUI decodes end-to-end via
+    /// the scan path (auto-detected geometry), not just via the
+    /// known-geometry decoder::decode entry point.
+    #[test]
+    fn scan_decode_round_trip_v2() {
+        use crate::encoder::encode_v2_with_kat;
+        let payload = b"v2 scan_decode round trip".to_vec();
+        let opts = EncodeOptions {
+            geometry: scan_geometry(),
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let salt = [0x12u8; 32];
+        let iv = [0x34u8; 12];
+        let pages =
+            encode_v2_with_kat(&payload, &opts, &meta(), b"correct horse", &salt, &iv).unwrap();
+        let bitmap = pages[0].bitmap.clone();
+        let recovered =
+            scan_decode(&[(&bitmap, pages[0].width, pages[0].height)], Some(b"correct horse"))
+                .unwrap();
         assert_eq!(recovered, payload);
     }
 

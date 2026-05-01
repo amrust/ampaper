@@ -1,3 +1,8 @@
+// Worker.rs is shared into this test binary via `#[path = ...]`,
+// which makes the decode-side API surface look "unused" since this
+// test only exercises encode. Silence the spurious warnings.
+#![allow(dead_code)]
+
 // Smoke test for the worker pipeline. Constructs an `EncodeRequest`
 // programmatically and drives it through `EncodeJob::spawn`, then
 // verifies BMPs land on disk and decode back to the input bytes.

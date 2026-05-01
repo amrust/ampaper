@@ -407,7 +407,7 @@ pub fn decode(
 ///   4. Decrypt via AES-256-GCM with key = PBKDF2(password, kdf_salt).
 ///   5. If `feature_flags & PBM_V2_COMPRESSED`, bzip2-decompress.
 ///   6. Truncate to `origsize`.
-fn decode_v2(
+pub(crate) fn decode_v2(
     cell1: V2SuperBlockCell1,
     cell2: Option<V2SuperBlockCell2>,
     data_blocks: &std::collections::BTreeMap<u32, [u8; NDATA]>,
