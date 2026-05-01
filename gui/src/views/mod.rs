@@ -9,5 +9,6 @@
 
 pub mod decode;
 pub mod encode;
+pub mod print;
 pub mod settings;
 pub mod stubs;

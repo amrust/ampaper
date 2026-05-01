@@ -43,11 +43,14 @@ impl Tab {
     pub fn is_available(self) -> bool {
         match self {
             Self::Encode | Self::Decode | Self::Settings => true,
-            // M9 (printing) and M10 (scanning) ship Windows-first.
-            // Even on Windows they are currently stubs until those
-            // milestones land — we expose the tabs now so the layout
-            // settles, but they render "coming in M9 / M10."
-            Self::Print | Self::ScanDevice => false,
+            // M9 ships Windows GDI printing; the view itself compiles
+            // everywhere but the print call is Windows-only and the
+            // dialog is Win32-modal. Show as available on Windows,
+            // greyed elsewhere.
+            Self::Print => cfg!(target_os = "windows"),
+            // M10 (scanning from device) is still a pure stub; the
+            // file-decode path is on the Decode tab already.
+            Self::ScanDevice => false,
         }
     }
 }
@@ -56,6 +59,7 @@ pub struct AmpaperApp {
     pub tab: Tab,
     pub encode: views::encode::EncodeView,
     pub decode: views::decode::DecodeView,
+    pub print: views::print::PrintView,
     pub settings: views::settings::SettingsView,
 }
 
@@ -79,6 +83,7 @@ impl Default for AmpaperApp {
             tab: Tab::Encode,
             encode: Default::default(),
             decode: Default::default(),
+            print: Default::default(),
             settings: Default::default(),
         }
     }
@@ -98,6 +103,7 @@ impl AmpaperApp {
             tab: persisted.last_tab.unwrap_or(Tab::Encode),
             encode: views::encode::EncodeView::with_settings(persisted.encode_settings),
             decode: Default::default(),
+            print: Default::default(),
             settings: Default::default(),
         }
     }
@@ -165,7 +171,7 @@ impl eframe::App for AmpaperApp {
             Tab::Encode => self.encode.show(ui),
             Tab::Decode => self.decode.show(ui),
             Tab::Settings => self.settings.show(ui),
-            Tab::Print => views::stubs::show_print_stub(ui),
+            Tab::Print => self.print.show(ui),
             Tab::ScanDevice => views::stubs::show_scan_device_stub(ui),
         });
 

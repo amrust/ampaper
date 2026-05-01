@@ -62,3 +62,21 @@ image = { version = "0.25", default-features = false, features = ["bmp", "png", 
 # eframe's `Context::request_repaint_after` lets us drive UI updates
 # from the worker thread without polling.
 # (No tokio yet — encode/decode are CPU-bound, std::thread is enough.)
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only GDI printing (M9). PrintDlgExW lets the user pick a
+# printer + tray + size; StartDoc/StartPage + StretchDIBits push
+# our 8-bpp grayscale BMP through the printer's DC. Linux/macOS
+# users keep the "save BMP, print however you want" fallback per
+# memory/cross_platform_goal.md.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    # StartDoc / StartPage / EndPage / EndDoc / DOCINFOW live under
+    # the Storage::Xps namespace in windows-rs even though they're
+    # plain old GDI functions in gdi32.dll. Naming quirk; just an
+    # extra feature flag to opt in.
+    "Win32_Storage_Xps",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+] }

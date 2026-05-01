@@ -8,6 +8,7 @@
 // shipped or the platform isn't supported yet.
 
 mod app;
+mod print;
 mod views;
 mod worker;
 
