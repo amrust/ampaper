@@ -180,6 +180,14 @@ pub fn render(geometry: &PageGeometry, blocks: &[PlacedBlock], black: u8) -> Vec
     let height = geometry.bitmap_height() as usize;
     let mut bitmap = vec![WHITE; width * height];
 
+    // Draw cell-boundary grid lines first. Mirrors Printer.cpp:830-855.
+    // These are the regular vertical and horizontal black stripes that
+    // the scan decoder's peak finder keys on to register the grid;
+    // without them an unrotated bitmap looks like sparse scattered
+    // dots with no obvious lattice. Drawn whether print_border is on
+    // or off — they're part of the wire format either way.
+    draw_grid_lines(&mut bitmap, width, height, geometry, black);
+
     for placed in blocks {
         let grid = dot_grid::block_to_dot_grid(&placed.bytes);
         let (x0, y0) = geometry.block_origin_pixels(placed.cell_index);
@@ -203,6 +211,62 @@ pub fn render(geometry: &PageGeometry, blocks: &[PlacedBlock], black: u8) -> Vec
     }
 
     bitmap
+}
+
+/// Draw the regular cell-boundary grid lines: nx+1 vertical stripes,
+/// ny+1 horizontal stripes, each `px` (vertical) or `py` (horizontal)
+/// pixels wide. Mirrors Printer.cpp:830-855.
+fn draw_grid_lines(
+    bitmap: &mut [u8],
+    width: usize,
+    height: usize,
+    geometry: &PageGeometry,
+    black: u8,
+) {
+    let dx = geometry.dx() as usize;
+    let dy = geometry.dy() as usize;
+    let px = geometry.px() as usize;
+    let py = geometry.py() as usize;
+    let nx = geometry.nx() as usize;
+    let ny = geometry.ny() as usize;
+    let border = geometry.border() as usize;
+    let lines_height = if geometry.print_border {
+        height
+    } else {
+        ny * CELL_SIZE_DOTS * dy
+    };
+    let lines_y_start = if geometry.print_border { 0 } else { border };
+    // Vertical lines at columns i*(NDOT+3)*dx + border, i in 0..=nx.
+    for i in 0..=nx {
+        let x_base = i * CELL_SIZE_DOTS * dx + border;
+        for y in lines_y_start..(lines_y_start + lines_height).min(height) {
+            for k in 0..px {
+                let x = x_base + k;
+                if x < width {
+                    bitmap[y * width + x] = black;
+                }
+            }
+        }
+    }
+    let lines_width = if geometry.print_border {
+        width
+    } else {
+        nx * CELL_SIZE_DOTS * dx + px
+    };
+    let lines_x_start = if geometry.print_border { 0 } else { border };
+    // Horizontal lines at rows j*(NDOT+3)*dy + border, j in 0..=ny.
+    for j in 0..=ny {
+        let y_base = j * CELL_SIZE_DOTS * dy + border;
+        for k in 0..py {
+            let y = y_base + k;
+            if y >= height {
+                break;
+            }
+            for x in lines_x_start..(lines_x_start + lines_width).min(width) {
+                bitmap[y * width + x] = black;
+            }
+        }
+    }
 }
 
 /// Extract every data cell as raw 128-byte blocks by sampling the
@@ -419,11 +483,28 @@ mod tests {
         assert_eq!(g.cells(), 72);
     }
 
+    /// A page with no placed blocks still has the cell-boundary grid
+    /// lines (added in M6's scan-decoder commit so peak finding has
+    /// regular vertical/horizontal stripes to register). Inside any
+    /// data cell — i.e. between grid lines, far enough in to skip
+    /// the cell's leading-edge dot allocation — the bitmap is white.
     #[test]
-    fn empty_page_renders_all_white() {
+    fn empty_page_has_grid_lines_but_white_dot_regions() {
         let g = small_geometry(false);
         let bitmap = render(&g, &[], BLACK_PAPER);
-        assert!(bitmap.iter().all(|&p| p == WHITE));
+        let width = g.bitmap_width() as usize;
+        // Sample the center of dot (15, 15) of cell 0 — well inside
+        // the cell, far from any grid line. Must be white since no
+        // block was placed.
+        let (x0, y0) = g.block_origin_pixels(0);
+        let probe_x = x0 as usize + 15 * g.dx() as usize;
+        let probe_y = y0 as usize + 15 * g.dy() as usize;
+        assert_eq!(bitmap[probe_y * width + probe_x], WHITE);
+        // Grid lines themselves are black at known positions.
+        // First vertical line is at column `border` for px pixels.
+        let line_x = g.border() as usize;
+        let probe_y2 = (g.bitmap_height() / 2) as usize;
+        assert_eq!(bitmap[probe_y2 * width + line_x], BLACK_PAPER);
     }
 
     /// A single block placed in cell 0 round-trips through render +

@@ -481,6 +481,579 @@ pub fn estimate_intensity(
     })
 }
 
+/// Result of an angle-finder fit. The `peak` and `step` fields are in
+/// bitmap-pixel units (already shifted into the bitmap's coordinate
+/// system); `angle` is radians. Both axes use the same struct.
+#[derive(Clone, Copy, Debug)]
+pub struct AngleInfo {
+    /// Position (in bitmap pixel coordinates) of the first detected
+    /// grid line for this axis.
+    pub peak: f32,
+    /// Step (per cell) in pixels — equal to `(NDOT + 3) * dot_pitch`
+    /// for a well-resolved grid.
+    pub step: f32,
+    /// Tilt angle in radians, ≈ `tan(θ)` for small θ. Positive means
+    /// vertical lines tilt right with increasing y (for x-axis) /
+    /// horizontal lines tilt down with increasing x (for y-axis).
+    pub angle: f32,
+    /// Quality / weight of the fit; the angle finder picks the
+    /// candidate with the largest weight.
+    pub weight: f32,
+}
+
+/// Find the angle and step of vertical grid lines. Mirrors
+/// `Getxangle` from Decoder.cpp:389-450.
+///
+/// Tries a fan of candidate angles in roughly ±5° (NHYST/20 each
+/// side, step 2). For each candidate, projects the search area onto
+/// a column histogram via affine X transform, then runs [`find_peaks`].
+/// Picks the candidate with the highest weight, with a small bias
+/// favoring zero angle (`1 / (|a| + 10)`) to break ties on flat-fit
+/// histograms — matches Decoder.cpp:432.
+///
+/// Returns `None` when no candidate yields a non-zero weight or
+/// when the best step is below NDOT (can't fit even one block).
+#[must_use]
+pub fn find_x_angle(
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+    intensity: &GridIntensity,
+) -> Option<AngleInfo> {
+    let sizex = width as usize;
+    let sizey = height as usize;
+    if bitmap.len() < sizex * sizey {
+        return None;
+    }
+    let x0 = intensity.searchx0 as i32;
+    let y0 = intensity.searchy0 as i32;
+    let dx = (intensity.searchx1 - intensity.searchx0) as i32;
+    let dy = (intensity.searchy1 - intensity.searchy0) as i32;
+    if dx <= 0 || dy <= 0 {
+        return None;
+    }
+    let ystep = (dy / 256).max(1);
+
+    let mut best: Option<AngleInfo> = None;
+    let mut max_weight = 0f32;
+    let amax = (NHYST as i32 / 20) * 2;
+    let mut a = -amax;
+    while a <= amax {
+        // Build a column histogram with affine X transform.
+        let mut h = vec![0i32; dx as usize];
+        let mut nh = vec![0i32; dx as usize];
+        let mut j = 0;
+        while j < dy {
+            let y = y0 + j;
+            let row_x = x0 + (y0 + j) * a / NHYST as i32;
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..dx as usize {
+                let x = row_x + i as i32;
+                if x >= 0 && x < sizex as i32 && y >= 0 && y < sizey as i32 {
+                    let idx = y as usize * sizex + x as usize;
+                    h[i] += i32::from(bitmap[idx]);
+                    nh[i] += 1;
+                }
+            }
+            j += ystep;
+        }
+        // Normalize the per-column average.
+        for (i, slot) in h.iter_mut().enumerate() {
+            if nh[i] > 0 {
+                *slot /= nh[i];
+            }
+        }
+        // Find peaks; add the small bias toward zero angle.
+        if let Some(info) = find_peaks(&h) {
+            let bias = 1.0 / (a.unsigned_abs() as f32 + 10.0);
+            let weight = info.weight + bias;
+            if weight > max_weight {
+                max_weight = weight;
+                best = Some(AngleInfo {
+                    peak: info.peak + x0 as f32,
+                    step: info.step,
+                    angle: a as f32 / NHYST as f32,
+                    weight,
+                });
+            }
+        }
+        a += 2;
+    }
+
+    let info = best?;
+    if info.step < NDOT as f32 {
+        return None;
+    }
+    Some(info)
+}
+
+/// Find the angle and step of horizontal grid lines. Mirrors
+/// `Getyangle` from Decoder.cpp:453-513. Same pattern as
+/// [`find_x_angle`] with axes swapped.
+///
+/// Has a tighter validity check than X: rejects fits where the
+/// detected Y step is more than 2.5x or less than 0.40x the X step,
+/// per Decoder.cpp:501-503. Real grids are roughly square; an
+/// asymmetric fit indicates a misregistered axis.
+#[must_use]
+pub fn find_y_angle(
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+    intensity: &GridIntensity,
+    x_angle: &AngleInfo,
+) -> Option<AngleInfo> {
+    let sizex = width as usize;
+    let sizey = height as usize;
+    if bitmap.len() < sizex * sizey {
+        return None;
+    }
+    let x0 = intensity.searchx0 as i32;
+    let y0 = intensity.searchy0 as i32;
+    let dx = (intensity.searchx1 - intensity.searchx0) as i32;
+    let dy = (intensity.searchy1 - intensity.searchy0) as i32;
+    if dx <= 0 || dy <= 0 {
+        return None;
+    }
+    let xstep = (dx / 256).max(1);
+
+    let mut best: Option<AngleInfo> = None;
+    let mut max_weight = 0f32;
+    let amax = (NHYST as i32 / 20) * 2;
+    let mut a = -amax;
+    while a <= amax {
+        let mut h = vec![0i32; dy as usize];
+        let mut nh = vec![0i32; dy as usize];
+        let mut i = 0;
+        while i < dx {
+            let x = x0 + i;
+            let col_y = y0 + (x0 + i) * a / NHYST as i32;
+            #[allow(clippy::needless_range_loop)]
+            for j in 0..dy as usize {
+                let y = col_y + j as i32;
+                if x >= 0 && x < sizex as i32 && y >= 0 && y < sizey as i32 {
+                    let idx = y as usize * sizex + x as usize;
+                    h[j] += i32::from(bitmap[idx]);
+                    nh[j] += 1;
+                }
+            }
+            i += xstep;
+        }
+        for (j, slot) in h.iter_mut().enumerate() {
+            if nh[j] > 0 {
+                *slot /= nh[j];
+            }
+        }
+        if let Some(info) = find_peaks(&h) {
+            let bias = 1.0 / (a.unsigned_abs() as f32 + 10.0);
+            let weight = info.weight + bias;
+            if weight > max_weight {
+                max_weight = weight;
+                best = Some(AngleInfo {
+                    peak: info.peak + y0 as f32,
+                    step: info.step,
+                    angle: a as f32 / NHYST as f32,
+                    weight,
+                });
+            }
+        }
+        a += 2;
+    }
+
+    let info = best?;
+    if info.step < NDOT as f32 {
+        return None;
+    }
+    // Sanity-check Y step against X step.
+    if info.step < x_angle.step * 0.40 || info.step > x_angle.step * 2.50 {
+        return None;
+    }
+    Some(info)
+}
+
+/// Sample one pixel at (x, y) in the bitmap with bilinear
+/// interpolation. Returns 255 (white) for out-of-bounds.
+fn sample_bilinear(bitmap: &[u8], width: usize, height: usize, x: f32, y: f32) -> u8 {
+    let ix = x.floor();
+    let iy = y.floor();
+    if ix < 0.0 || iy < 0.0 || ix as i32 >= width as i32 - 1 || iy as i32 >= height as i32 - 1 {
+        return 255;
+    }
+    let xres = x - ix;
+    let yres = y - iy;
+    let ux = ix as usize;
+    let uy = iy as usize;
+    let p00 = f32::from(bitmap[uy * width + ux]);
+    let p01 = f32::from(bitmap[uy * width + ux + 1]);
+    let p10 = f32::from(bitmap[(uy + 1) * width + ux]);
+    let p11 = f32::from(bitmap[(uy + 1) * width + ux + 1]);
+    let top = p00 * (1.0 - xres) + p01 * xres;
+    let bot = p10 * (1.0 - xres) + p11 * xres;
+    let p = top * (1.0 - yres) + bot * yres;
+    p.clamp(0.0, 255.0) as u8
+}
+
+/// Sample a single block at cell position `(posx, posy)` and decode
+/// its 32×32 dot grid into 128 wire bytes. Uses the affine transform
+/// from `(x_angle, y_angle)` to handle small grid rotation, with
+/// bilinear interpolation on each dot center plus a configurable
+/// pixel-level `(shift_x, shift_y)` offset applied to every dot.
+/// Callers can sweep shifts to find the offset that gives a valid
+/// CRC — this mirrors Decoder.cpp:716-746 which builds 9 candidate
+/// grids per block, one per (-1, 0, +1) × (-1, 0, +1) shift.
+///
+/// Does NOT try multiple orientations — assumes natural page
+/// orientation. The full multi-orientation search from
+/// Decoder.cpp:170-216 is left for a follow-on commit; this
+/// happy-path version covers ±5° rotation (the angle finders' range)
+/// and small noise but not 90° / mirrored input.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn sample_block_at(
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+    posx: u32,
+    posy: u32,
+    x_angle: &AngleInfo,
+    y_angle: &AngleInfo,
+    threshold: u8,
+    shift_x: f32,
+    shift_y: f32,
+) -> [u8; crate::block::BLOCK_BYTES] {
+    let w = width as usize;
+    let h = height as usize;
+    // Per-cell origin (top-left dot of the block) in undistorted coords.
+    let cell_x = x_angle.peak + x_angle.step * posx as f32;
+    let cell_y = y_angle.peak + y_angle.step * posy as f32;
+    // 2-dot leading border per FORMAT-V1.md §4.2. The encoder draws
+    // each dot at the LEFT edge of its dot-pitch slot (not centered),
+    // so the sampling target is just `cell + 2 * pitch` — adding
+    // another `pitch/2` for "centering" lands in the white gap
+    // between dots.
+    let dot_pitch_x = x_angle.step / (NDOT as f32 + 3.0);
+    let dot_pitch_y = y_angle.step / (NDOT as f32 + 3.0);
+    let first_dot_x = cell_x + 2.0 * dot_pitch_x;
+    let first_dot_y = cell_y + 2.0 * dot_pitch_y;
+
+    let mut grid = [0u32; NDOT];
+    for (j, slot) in grid.iter_mut().enumerate() {
+        let mut row = 0u32;
+        for i in 0..NDOT {
+            let dot_x = first_dot_x + i as f32 * dot_pitch_x;
+            let dot_y = first_dot_y + j as f32 * dot_pitch_y;
+            // Apply affine rotation, then the per-call shift offset
+            // so the caller can sweep ±1 pixel shifts to find the
+            // best CRC match (Decoder.cpp:716-746).
+            let bmp_x = dot_x + dot_y * x_angle.angle + shift_x;
+            let bmp_y = dot_y + dot_x * y_angle.angle + shift_y;
+            // 2-by-2 averaging mirrors Decoder.cpp:739-743's
+            // dotsize=2 case. Wider windows pick up adjacent dots
+            // (dot pitch is only 3 pixels). For tolerating larger
+            // registration errors from integer-step angle search,
+            // we rely on Reed-Solomon's 16-byte correction running
+            // downstream — see scan_decode where decode8 runs on
+            // every extracted cell before CRC verification.
+            let p00 = u16::from(sample_bilinear(bitmap, w, h, bmp_x, bmp_y));
+            let p01 = u16::from(sample_bilinear(bitmap, w, h, bmp_x + 1.0, bmp_y));
+            let p10 = u16::from(sample_bilinear(bitmap, w, h, bmp_x, bmp_y + 1.0));
+            let p11 = u16::from(sample_bilinear(bitmap, w, h, bmp_x + 1.0, bmp_y + 1.0));
+            let pixel = ((p00 + p01 + p10 + p11) / 4) as u8;
+            if pixel < threshold {
+                row |= 1u32 << i;
+            }
+        }
+        *slot = row;
+    }
+    crate::dot_grid::dot_grid_to_block(&grid)
+}
+
+/// Geometry context derived from a scanned bitmap. The output of the
+/// peak / intensity / angle pipeline; downstream cell sampling
+/// consumes this struct rather than re-running the analysis.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanGeometry {
+    pub x_angle: AngleInfo,
+    pub y_angle: AngleInfo,
+    pub threshold: u8,
+    pub nposx: u32,
+    pub nposy: u32,
+}
+
+/// Run the bounds → intensity → angles pipeline and pull peaks back
+/// to the first cell. Returns `None` when any stage fails.
+#[must_use]
+pub fn detect_geometry(bitmap: &[u8], width: u32, height: u32) -> Option<ScanGeometry> {
+    let bounds = find_grid_position(bitmap, width, height)?;
+    let intensity = estimate_intensity(bitmap, width, height, &bounds)?;
+    let xa = find_x_angle(bitmap, width, height, &intensity)?;
+    let ya = find_y_angle(bitmap, width, height, &intensity, &xa)?;
+    let mut x_peak = xa.peak;
+    let mut y_peak = ya.peak;
+    while x_peak >= xa.step {
+        x_peak -= xa.step;
+    }
+    while y_peak >= ya.step {
+        y_peak -= ya.step;
+    }
+    let xa = AngleInfo { peak: x_peak, ..xa };
+    let ya = AngleInfo { peak: y_peak, ..ya };
+    let nposx = ((width as f32 - x_peak) / xa.step) as u32;
+    let nposy = ((height as f32 - y_peak) / ya.step) as u32;
+    if nposx == 0 || nposy == 0 {
+        return None;
+    }
+    let threshold = ((u16::from(intensity.cmin) + u16::from(intensity.cmax)) / 2) as u8;
+    Some(ScanGeometry {
+        x_angle: xa,
+        y_angle: ya,
+        threshold,
+        nposx,
+        nposy,
+    })
+}
+
+/// 9-shift matrix from Decoder.cpp:716-728 — try each (-1, 0, +1) ×
+/// (-1, 0, +1) integer-pixel offset and accept the first that gives
+/// a CRC-verified block after Reed-Solomon correction. The natural
+/// shift `(0, 0)` is tried first because Decoder.cpp:751 reports it
+/// as "the most probable good candidate".
+const SHIFT_MATRIX: [(f32, f32); 9] = [
+    (0.0, 0.0),
+    (-1.0, 0.0),
+    (1.0, 0.0),
+    (0.0, -1.0),
+    (0.0, 1.0),
+    (-1.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 1.0),
+    (1.0, 1.0),
+];
+
+/// Sample one cell at `(posx, posy)`, trying every shift in
+/// [`SHIFT_MATRIX`] and accepting the first that decodes to a
+/// CRC-verified block (after Reed-Solomon correction). Falls back
+/// to the natural-shift sample if no shift verifies — caller's CRC
+/// check will then reject it.
+fn sample_block_best_shift(
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+    posx: u32,
+    posy: u32,
+    geometry: &ScanGeometry,
+) -> [u8; crate::block::BLOCK_BYTES] {
+    let mut natural = sample_block_at(
+        bitmap,
+        width,
+        height,
+        posx,
+        posy,
+        &geometry.x_angle,
+        &geometry.y_angle,
+        geometry.threshold,
+        0.0,
+        0.0,
+    );
+    let _ = crate::ecc::decode8(&mut natural);
+    if crate::block::Block::from_bytes(&natural).verify_crc() {
+        return natural;
+    }
+    for &(sx, sy) in &SHIFT_MATRIX[1..] {
+        let mut cell = sample_block_at(
+            bitmap,
+            width,
+            height,
+            posx,
+            posy,
+            &geometry.x_angle,
+            &geometry.y_angle,
+            geometry.threshold,
+            sx,
+            sy,
+        );
+        let _ = crate::ecc::decode8(&mut cell);
+        if crate::block::Block::from_bytes(&cell).verify_crc() {
+            return cell;
+        }
+    }
+    // No shift produced a CRC-verified block. Return the
+    // (already-RS-corrected) natural sample so callers can still
+    // inspect it; their CRC check will drop it.
+    natural
+}
+
+/// Top-level scan extractor: find grid bounds + intensity + angles,
+/// then walk every (posx, posy) cell position and sample the
+/// resulting 128 bytes. Each cell is sweep-sampled across the 9
+/// integer-shift matrix and Reed-Solomon corrected; the returned
+/// bytes are post-RS, so callers should run [`crate::block::Block::verify_crc`]
+/// before trusting them.
+///
+/// Returns `None` when the scan pipeline cannot register the grid
+/// (bitmap too small, no contrast, no peaks, asymmetric Y step,
+/// etc.). Distinguishes "couldn't find grid" from "grid found but
+/// some blocks unreadable" — the latter is normal and individual
+/// blocks fail CRC verification later.
+#[must_use]
+pub fn scan_extract(
+    bitmap: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<Vec<[u8; crate::block::BLOCK_BYTES]>> {
+    let geometry = detect_geometry(bitmap, width, height)?;
+    let mut out = Vec::with_capacity((geometry.nposx * geometry.nposy) as usize);
+    for posy in 0..geometry.nposy {
+        for posx in 0..geometry.nposx {
+            out.push(sample_block_best_shift(
+                bitmap, width, height, posx, posy, &geometry,
+            ));
+        }
+    }
+    Some(out)
+}
+
+/// Scan-decode a list of bitmaps to the original input bytes. Same
+/// reassembly contract as `crate::decoder::decode` — SuperBlock-driven
+/// metadata, XOR recovery for one missing block per group, optional
+/// bzip2 decompression — but uses [`scan_extract`] instead of
+/// known-geometry sampling. This is the M6 sub-bullet 1 entry point.
+///
+/// Each input is `(bitmap_bytes, width, height)`. Returns the
+/// original input bytes on success.
+pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decoder::DecodeError> {
+    use crate::block::{
+        Block, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, PBM_ENCRYPTED, SuperBlock,
+    };
+    use crate::decoder::DecodeError;
+
+    let mut superblock: Option<SuperBlock> = None;
+    let mut data_blocks: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
+    let mut recovery_blocks: Vec<(u32, u8, [u8; NDATA])> = Vec::new();
+    let mut any_encrypted = false;
+    let mut metadata_inconsistency = false;
+
+    for &(bitmap, width, height) in pages {
+        // scan_extract already runs Reed-Solomon correction on each
+        // cell via the 9-shift sampling sweep; just CRC-filter here.
+        let cells = scan_extract(bitmap, width, height).ok_or(DecodeError::NoSuperBlock)?;
+        for cell in cells {
+            let block = Block::from_bytes(&cell);
+            if !block.verify_crc() {
+                continue;
+            }
+            if block.is_super() {
+                let parsed = match SuperBlock::from_bytes(&cell) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if !parsed.verify_crc() {
+                    continue;
+                }
+                if parsed.mode & PBM_ENCRYPTED != 0 {
+                    any_encrypted = true;
+                }
+                if let Some(existing) = superblock {
+                    if existing.datasize != parsed.datasize
+                        || existing.origsize != parsed.origsize
+                        || existing.mode != parsed.mode
+                        || existing.filecrc != parsed.filecrc
+                        || existing.name != parsed.name
+                    {
+                        metadata_inconsistency = true;
+                    }
+                } else {
+                    superblock = Some(parsed);
+                }
+            } else if block.is_data() {
+                data_blocks.entry(block.offset()).or_insert(block.data);
+            } else if block.is_recovery() {
+                let ngroup = block.ngroup();
+                if (NGROUP_MIN..=NGROUP_MAX).contains(&ngroup) {
+                    recovery_blocks.push((block.offset(), ngroup, block.data));
+                }
+            }
+        }
+    }
+
+    if any_encrypted {
+        return Err(DecodeError::EncryptionNotSupported);
+    }
+    if metadata_inconsistency {
+        return Err(DecodeError::InconsistentSuperBlocks);
+    }
+    let superblock = superblock.ok_or(DecodeError::NoSuperBlock)?;
+    let datasize = superblock.datasize;
+
+    let mut buf = vec![0u8; datasize as usize];
+    let mut filled = vec![false; (datasize.div_ceil(NDATA as u32)) as usize];
+    for (&offset, data) in &data_blocks {
+        if offset >= datasize {
+            continue;
+        }
+        let off = offset as usize;
+        let copy_len = NDATA.min(buf.len() - off);
+        buf[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+        let block_index = off / NDATA;
+        if block_index < filled.len() {
+            filled[block_index] = true;
+        }
+    }
+    for (recovery_offset, ngroup, recovery_data) in &recovery_blocks {
+        let group_size = *ngroup as usize;
+        let group_first_block = *recovery_offset as usize / NDATA;
+        if group_first_block + group_size > filled.len() {
+            continue;
+        }
+        let mut missing_count = 0usize;
+        let mut missing_idx = 0usize;
+        for k in 0..group_size {
+            let bi = group_first_block + k;
+            if !filled[bi] {
+                missing_count += 1;
+                missing_idx = bi;
+            }
+        }
+        if missing_count != 1 {
+            continue;
+        }
+        let mut recovered = *recovery_data;
+        for r in &mut recovered {
+            *r ^= 0xFF;
+        }
+        for k in 0..group_size {
+            let bi = group_first_block + k;
+            if bi == missing_idx {
+                continue;
+            }
+            let off = bi * NDATA;
+            let end = (off + NDATA).min(buf.len());
+            if end <= off {
+                continue;
+            }
+            for (r, &b) in recovered.iter_mut().zip(buf[off..end].iter()) {
+                *r ^= b;
+            }
+        }
+        let off = missing_idx * NDATA;
+        let copy_len = NDATA.min(buf.len().saturating_sub(off));
+        buf[off..off + copy_len].copy_from_slice(&recovered[..copy_len]);
+        filled[missing_idx] = true;
+    }
+    for (i, &ok) in filled.iter().enumerate() {
+        if !ok {
+            return Err(DecodeError::UnrecoverableGap {
+                offset: (i * NDATA) as u32,
+            });
+        }
+    }
+    if superblock.mode & PBM_COMPRESSED != 0 {
+        buf = crate::bz::decompress(&buf).map_err(|e| DecodeError::BzipFailed(e.to_string()))?;
+    }
+    buf.truncate(superblock.origsize as usize);
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +1189,156 @@ mod tests {
         // 3rd / 97th percentile of a 50/50 mix should be at the extremes.
         assert_eq!(intensity.cmin, 0);
         assert_eq!(intensity.cmax, 255);
+    }
+
+    use crate::encoder::{EncodeOptions, FileMeta, encode};
+    use crate::page::{BLACK_PAPER, PageGeometry};
+
+    fn scan_geometry() -> PageGeometry {
+        PageGeometry {
+            ppix: 600,
+            ppiy: 600,
+            dpi: 200,
+            dot_percent: 70,
+            // 1500x1500 is bigger than NHYST so estimate_intensity
+            // can sample its full window; it also fits a sensible
+            // number of cells (14x14 = 196) for round-trip testing.
+            width: 1500,
+            height: 1500,
+            print_border: true,
+        }
+    }
+
+    fn meta() -> FileMeta<'static> {
+        FileMeta {
+            name: "scan-test.bin",
+            modified: 0,
+            attributes: 0x80,
+        }
+    }
+
+    fn encode_payload(payload: &[u8]) -> (Vec<u8>, u32, u32) {
+        let opts = EncodeOptions {
+            geometry: scan_geometry(),
+            redundancy: 5,
+            compress: false,
+            black: BLACK_PAPER,
+        };
+        let pages = encode(payload, &opts, &meta()).unwrap();
+        let bitmap = pages[0].bitmap.clone();
+        (bitmap, pages[0].width, pages[0].height)
+    }
+
+    /// Apply a small affine rotation to a bitmap by sampling the
+    /// rotated source coordinates with bilinear interpolation. The
+    /// rotation is around the image center; `theta` in radians,
+    /// positive rotates counter-clockwise. Edges fill with white
+    /// (255) — same convention as a real scanner outside the page.
+    fn rotate_bitmap(bitmap: &[u8], width: u32, height: u32, theta: f32) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let cx = width as f32 / 2.0;
+        let cy = height as f32 / 2.0;
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+        let mut out = vec![255u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                // Inverse rotation: where in the source did this
+                // output pixel come from?
+                let sx = dx * cos_t + dy * sin_t + cx;
+                let sy = -dx * sin_t + dy * cos_t + cy;
+                out[y * w + x] = sample_bilinear(bitmap, w, h, sx, sy);
+            }
+        }
+        out
+    }
+
+    /// Apply small additive noise to a bitmap. Uses a deterministic
+    /// LCG (no `rand` dep) so test failures are reproducible.
+    fn noisy_bitmap(bitmap: &[u8], amplitude: i16, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        bitmap
+            .iter()
+            .map(|&p| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = ((state >> 33) as i64 as i32) % (i32::from(amplitude * 2 + 1));
+                let r = r - i32::from(amplitude);
+                let v = i32::from(p) + r;
+                v.clamp(0, 255) as u8
+            })
+            .collect()
+    }
+
+    /// Angle finders return a near-zero angle for an unrotated
+    /// encoder bitmap, since the grid is axis-aligned by construction.
+    #[test]
+    fn angle_finders_detect_zero_on_unrotated_bitmap() {
+        let payload: Vec<u8> = (0..500u32).map(|i| (i * 7) as u8).collect();
+        let (bitmap, w, h) = encode_payload(&payload);
+        let bounds = find_grid_position(&bitmap, w, h).unwrap();
+        let intensity = estimate_intensity(&bitmap, w, h, &bounds).unwrap();
+        let xa = find_x_angle(&bitmap, w, h, &intensity).unwrap();
+        let ya = find_y_angle(&bitmap, w, h, &intensity, &xa).unwrap();
+        // |angle| should be small (a few NHYST units / NHYST = a fraction
+        // of a degree). Allow up to ±0.02 rad ~= ±1.1°.
+        assert!(xa.angle.abs() < 0.02, "x angle {} not near 0", xa.angle);
+        assert!(ya.angle.abs() < 0.02, "y angle {} not near 0", ya.angle);
+        // Step should equal (NDOT+3) * dx — i.e., one cell pitch.
+        // For 600 DPI / 200 dpi, dx = 3, so step = 35*3 = 105.
+        assert!(
+            (xa.step - 105.0).abs() < 5.0,
+            "x step {} not near 105",
+            xa.step
+        );
+        assert!(
+            (ya.step - 105.0).abs() < 5.0,
+            "y step {} not near 105",
+            ya.step
+        );
+    }
+
+    /// scan_decode round-trips an encoder-produced bitmap. This
+    /// exercises the full peak-finder → angle-finder → block-sampler
+    /// pipeline end-to-end, even though the unrotated case is the
+    /// happy path.
+    #[test]
+    fn scan_decode_round_trip_unrotated() {
+        let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
+        let (bitmap, w, h) = encode_payload(&payload);
+        let recovered = scan_decode(&[(&bitmap, w, h)]).unwrap();
+        assert_eq!(recovered, payload);
+    }
+
+    /// Round-trip with a small rotation (~0.57°). The angle finders
+    /// detect the rotation, and the 9-shift sampling sweep finds
+    /// the integer-pixel offset that reads each dot correctly. RS
+    /// then corrects the handful of bit errors from sub-pixel
+    /// sampling residual.
+    #[test]
+    fn scan_decode_round_trip_with_small_rotation() {
+        let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
+        let (bitmap, w, h) = encode_payload(&payload);
+        let rotated = rotate_bitmap(&bitmap, w, h, 0.01);
+        let recovered = scan_decode(&[(&rotated, w, h)]).unwrap();
+        assert_eq!(recovered, payload);
+    }
+
+    /// Round-trip with low-amplitude noise. CRC + ECC will catch
+    /// any flipped dots and drop the affected blocks; recovery
+    /// blocks fill them in. Amplitude is small enough that the
+    /// 0/255 black/white separation survives.
+    #[test]
+    fn scan_decode_round_trip_with_noise() {
+        let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
+        let (bitmap, w, h) = encode_payload(&payload);
+        let noisy = noisy_bitmap(&bitmap, 30, 0xAA55_DEAD_BEEF_F00D);
+        let recovered = scan_decode(&[(&noisy, w, h)]).unwrap();
+        assert_eq!(recovered, payload);
     }
 
     /// Pipeline integration smoke-test: run all three primitives
