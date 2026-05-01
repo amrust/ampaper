@@ -23,19 +23,29 @@ Decision record. The user's ask: read-only AES-192 for compatibility with PaperB
 - AES-NI exists on every Windows-supported x64 CPU since 2010 and every ARM64 with AES extension. Speed isn't a constraint.
 - GCM is a NIST-approved AEAD; reviewers and auditors recognize it instantly.
 - A 96-bit IV is small enough not to hurt our per-page byte budget.
-- Tag length: 128-bit (full GCM tag), no truncation. Saving 8 bytes / block isn't worth the security tradeoff.
+- Tag length: 128-bit (full GCM tag), no truncation.
 
-**IV-reuse hardening.** GCM's failure mode is bad enough that we need a structural answer:
+**GCM granularity decision (2026-05-01): file-level, not per-block.** The original draft of this document specified per-block GCM with IVs derived as `SHA-256(page_index || block_index || file_random_salt)[:12]`. That bakes encryption INTO the block layer and costs ~18% of the data area per block (the 16-byte tag eats into NDATA). For a future where M12 ships color encoding (CMYK/RGB sub-channels giving 3-4× density) plus adaptive (n, k) RS, per-block GCM compounds the crypto tax with every density gain — a 4-color page loses 16 bytes per block per plane. File-level GCM puts encryption ABOVE the block layer; M12 changes are layer-orthogonal.
 
-- **IV construction:** `IV = SHA-256(page_index || block_index || file_random_salt)[:12]`, where `file_random_salt` is 256 bits of OS entropy generated fresh per encode operation and stored alongside (or in) the page header.
-- This makes IV reuse impossible across blocks within one encode and impossible across encode operations (different salt). The salt is **not** secret; it's there for IV uniqueness, not as a secret.
-- Document this in `FORMAT-V2.md` when M11 lands so future implementers don't reinvent it differently.
+The only real argument for per-block GCM is per-block cryptographic authenticity vs CRC's malleability. That matters for an adversarial network channel, not for a paper archive: realistic threats are scan errors (RS handles per-block) and whole-file tampering (file-level GCM tag detects). Selective per-block tampering on a printed page is contrived.
+
+**IV scheme.** Single 96-bit IV per encode operation, generated fresh from `getrandom`. Stored in the v2 SuperBlock. With file-level GCM and a per-encode-operation IV, IV reuse is structurally impossible across encodes. Per-block IV derivation isn't needed when there's only one encryption operation.
+
+**Tag placement.** The 16-byte GCM tag is appended to the ciphertext (not stored in the SuperBlock header). `datasize` in the v2 SuperBlock includes the tag length, so decoders that recover `datasize` bytes have the tag automatically.
+
+**AAD construction.** The Associated Authenticated Data passed to GCM includes:
+- v2 magic bytes (`b"ampaper-v2"` or equivalent)
+- `page_count` (u32, total pages in this encode)
+- `origsize` (u32, plaintext byte count)
+- `datasize` (u32, ciphertext + tag byte count)
+
+This binds the tag to structural metadata: an attacker cannot truncate pages, change reported sizes, or splice files without tag mismatch.
 
 ## KDF for the v2 forward mode
 
 - **PBKDF2-HMAC-SHA-256, 600,000 iterations** — OWASP 2023 minimum for SHA-256 PBKDF2.
-- 256-bit salt (separate from the IV salt above; KDF salt is per-encode-operation).
-- Output: 256-bit AES key + 96-bit IV nonce-prefix.
+- 256-bit salt, per-encode-operation, fresh from `getrandom`. Stored in the v2 SuperBlock.
+- Output: 256-bit AES key. (The GCM IV is independent random data, not derived from the password.)
 
 Argon2id would be stronger but adds a dependency + tunable parameters that scare archivists ("will this still verify in 30 years if the parameters change?"). PBKDF2-HMAC-SHA-256 with a high iteration count is the conservative archival choice.
 
