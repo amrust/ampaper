@@ -427,56 +427,18 @@ mod tests {
         }
     }
 
-    /// Decode a single rendered page back into the input bytes.
-    /// Used by the round-trip tests as a stand-in for M6's full
-    /// decoder, which uses the same lower-level `page::extract`.
+    /// Decode rendered pages back into the input bytes via the
+    /// public crate::decoder API. Same module-internal helper that
+    /// used to live here was promoted to `decoder::decode` once the
+    /// M6 synthetic decoder landed; this thin wrapper keeps the test
+    /// call sites short.
     fn decode_pages(pages: &[EncodedPage], geometry: &PageGeometry) -> Vec<u8> {
-        // For each page, scan extracted cells, pick the ones whose
-        // CRC verifies. Sort by addr (the offset field) and reassemble.
-        let mut by_offset: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
-        let mut datasize: u32 = 0;
-        let mut origsize: u32 = 0;
-        let mut compressed = false;
-        for page in pages {
-            let cells = page::extract(geometry, &page.bitmap, page::DEFAULT_THRESHOLD);
-            for cell in cells {
-                let block = Block::from_bytes(&cell);
-                if !block.verify_crc() {
-                    continue;
-                }
-                if block.is_super() {
-                    if let Ok(s) = SuperBlock::from_bytes(&cell) {
-                        if s.verify_crc() {
-                            datasize = s.datasize;
-                            origsize = s.origsize;
-                            compressed = s.mode & PBM_COMPRESSED != 0;
-                        }
-                    }
-                } else if block.is_data() {
-                    by_offset.insert(block.offset(), block.data);
-                }
-            }
-        }
-        // Reassemble in offset order. Pad missing slots with zero.
-        // Filler blocks beyond the last useful byte (offset >=
-        // datasize) are silently ignored — the encoder emits them at
-        // synthetic offsets to fill out partial groups, but the
-        // decoder side knows their content is meaningless.
-        let mut buf = vec![0u8; datasize as usize];
-        for (off, data) in &by_offset {
-            let off = *off as usize;
-            if off >= buf.len() {
-                continue;
-            }
-            let copy_len = (NDATA).min(buf.len() - off);
-            buf[off..off + copy_len].copy_from_slice(&data[..copy_len]);
-        }
-        // Decompress if applicable.
-        if compressed {
-            buf = bz::decompress(&buf).expect("page-encoded bzip2 must decompress");
-        }
-        buf.truncate(origsize as usize);
-        buf
+        let bitmaps: Vec<Vec<u8>> = pages.iter().map(|p| p.bitmap.clone()).collect();
+        let opts = crate::decoder::DecodeOptions {
+            geometry: *geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        crate::decoder::decode(&bitmaps, &opts).expect("encoded pages must decode in tests")
     }
 
     #[test]

@@ -8,6 +8,7 @@
 pub mod block;
 pub mod bz;
 pub mod crc;
+pub mod decoder;
 pub mod dot_grid;
 pub mod ecc;
 pub mod encoder;
