@@ -58,6 +58,22 @@ rfd = "0.17"
 # dev-dep for golden-vector tests; here it's a real runtime dep.
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "jpeg"] }
 
+# Pure-Rust PDF writer (MIT). PDF is an open ISO standard
+# (ISO 32000-1 / -2) — Adobe co-authored the spec but it's been
+# free + open since 2008, and PDF/A is *the* archival standard.
+# printpdf lets us embed the raw 8-bit grayscale bitmap as an
+# XObject and place it on a page sized at the chosen DPI, no Adobe
+# tooling involved. Used by the Print tab's "Save as PDF" path so
+# users without a Windows printer driver can still produce a
+# print-ready archival document.
+#
+# `default-features = false` drops the `html` feature, which pulls
+# in azul-layout / kuchiki / fontconfig — heavy and irrelevant for
+# our "embed a raw bitmap as an XObject" use case. We only need
+# `images` to enable image XObjects; we feed raw R8 bytes directly
+# so no per-format decoder feature (bmp/png/jpeg/...) is needed.
+printpdf = { version = "0.9", default-features = false, features = ["images"] }
+
 # Convenience for spawning blocking codec jobs onto a worker thread.
 # eframe's `Context::request_repaint_after` lets us drive UI updates
 # from the worker thread without polling.

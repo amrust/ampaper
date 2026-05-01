@@ -97,6 +97,86 @@ pub fn print_pages(_pages: &[PrintPage], _doc_name: &str) -> Result<(), PrintErr
     Err(PrintError::PlatformUnsupported)
 }
 
+/// Write the pages out as a multi-page PDF at `path`. Cross-platform
+/// — pure Rust via the `printpdf` crate (MIT). Each PDF page is
+/// sized at `(width / dpi)` × `(height / dpi)` inches so 1 device
+/// pixel = 1/dpi inch on paper, matching what a direct print at
+/// the same DPI would produce.
+///
+/// Note: the source BMPs don't carry DPI metadata reliably (PB 1.10
+/// BMPs do, but the `image` crate's BmpEncoder we use on the encode
+/// side doesn't set it), so the caller passes `dpi` explicitly. The
+/// natural value is whatever was used at encode time — typically
+/// 600 DPI for consumer laser printers (the EncodeView default).
+pub fn save_pages_as_pdf(
+    pages: &[PrintPage],
+    dpi: u32,
+    doc_name: &str,
+    path: &Path,
+) -> Result<(), PrintError> {
+    use printpdf::{
+        Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, RawImageData, RawImageFormat,
+        XObjectTransform,
+    };
+
+    if pages.is_empty() {
+        return Err(PrintError::Io {
+            path: path.display().to_string(),
+            message: "no pages to write".into(),
+        });
+    }
+    if dpi == 0 {
+        return Err(PrintError::Io {
+            path: path.display().to_string(),
+            message: "DPI must be > 0".into(),
+        });
+    }
+
+    let mut doc = PdfDocument::new(doc_name);
+    let mut pdf_pages = Vec::with_capacity(pages.len());
+
+    for page in pages {
+        // Embed the raw 8-bit grayscale bytes. printpdf has an R8
+        // (single-channel u8) format, exactly what our codec emits.
+        let raw = RawImage {
+            width: page.width as usize,
+            height: page.height as usize,
+            data_format: RawImageFormat::R8,
+            pixels: RawImageData::U8(page.bitmap.clone()),
+            tag: Vec::new(),
+        };
+        let image_id = doc.add_image(&raw);
+
+        // Place the image at the origin with the right DPI transform.
+        // printpdf's XObjectTransform.dpi tells the layer "this image
+        // is meant to print at this many pixels per inch" — combined
+        // with the page size below, that fixes pixel pitch on paper.
+        let ops = vec![Op::UseXobject {
+            id: image_id,
+            transform: XObjectTransform {
+                dpi: Some(dpi as f32),
+                ..Default::default()
+            },
+        }];
+
+        // PDF page size = bitmap inches, converted to Mm.
+        let width_mm = (page.width as f32 / dpi as f32) * 25.4;
+        let height_mm = (page.height as f32 / dpi as f32) * 25.4;
+        pdf_pages.push(PdfPage::new(Mm(width_mm), Mm(height_mm), ops));
+    }
+
+    doc.with_pages(pdf_pages);
+
+    let opts = PdfSaveOptions::default();
+    let mut warnings = Vec::new();
+    let bytes = doc.save(&opts, &mut warnings);
+    std::fs::write(path, bytes).map_err(|e| PrintError::Io {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
 #[cfg(windows)]
 mod win32 {
     use super::{PrintError, PrintPage};
