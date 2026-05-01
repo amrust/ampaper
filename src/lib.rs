@@ -13,3 +13,4 @@ pub mod dot_grid;
 pub mod ecc;
 pub mod encoder;
 pub mod page;
+pub mod scan;
