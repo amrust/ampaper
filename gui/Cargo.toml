@@ -15,12 +15,28 @@ rust-version = "1.85"
 ampaper = { path = ".." }
 
 # eframe = the native (and web) wrapper around egui. Pulls in winit
-# for windowing + wgpu for rendering on all three platforms. Pure-
+# for windowing + a rendering backend on all three platforms. Pure-
 # Rust dep tree; no GTK / Qt / WebView. See
 # memory/gui_stack_decision.md for why.
+#
+# Backend choice: `glow` (OpenGL) over the default `wgpu`. The
+# default-feature wgpu backend was crashing at startup on this
+# machine with STATUS_ACCESS_VIOLATION inside native driver code —
+# wgpu's adapter selection sometimes hits Windows GPU/driver edge
+# cases that we don't want to chase for an archival utility. glow
+# is more conservative (OpenGL via ANGLE/native) and "just works"
+# across the broadest set of installs, which matches an archival
+# tool that needs to launch reliably 10 years from now.
+#
+# `persistence` is intentionally NOT pulled in yet; we'll enable it
+# (with the `ron` + `serde` deps it implies) when settings storage
+# lands.
 eframe = { version = "0.34", default-features = false, features = [
-    "default_fonts",  # bundle Latin + Hiragino Sans fallback
-    "wgpu",           # native rendering backend; works on Win/Mac/Linux
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
 ] }
 
 # Convenience for spawning blocking codec jobs onto a worker thread.
