@@ -15,14 +15,18 @@ Each vector is **two or three files** sharing a base name:
 ```
 <name>.input          Raw bytes fed into PaperBack 1.10's encoder.
                       May be any size up to MAXSIZE (256 MB minus 128).
-<name>.bmp / .png     PaperBack 1.10's encoder output. Captured via the
+<name>.bmp            PaperBack 1.10's encoder output. Captured via the
                       "save to BMP" debug path: in PB 1.10's GUI choose
                       "File → Save bitmap…" instead of "File → Print",
                       or pass a non-empty `outbmp` to `Printfile()` if
                       driving programmatically. See FORMAT-V1.md §8.
-                      A 1500x1500 grayscale BMP is ~26 MB; converting
-                      to PNG losslessly drops that to ~100 KB and is
-                      strongly preferred for committed vectors.
+                      Stored as BMP because that's the only format PB
+                      1.10 itself can read back; converting to PNG
+                      and feeding that to PB 1.10 won't work (PB 1.10
+                      doesn't know PNG). ampaper's decoder reads
+                      either format via the `image` crate, but the
+                      ground-truth artifact stays as the BMP that PB
+                      1.10 emitted.
 <name>.txt            (Recommended) Capture metadata in plain text:
                         - PaperBack version + checksum of the binary used
                         - Encoder options (dpi, dotpercent, redundancy,
@@ -31,10 +35,22 @@ Each vector is **two or three files** sharing a base name:
                       Read once; never asserted against.
 ```
 
-For paper-print captures (printed page scanned back at ≥ 900 DPI),
-use the `.scan.png` suffix and a separate `scanned/` subdirectory —
-those exercise different code paths than synthetic bitmaps and are
-harder to reproduce, so they're tracked separately.
+### Paper-print captures
+
+PaperBack 1.10 has **no save-scan feature** — scans are consumed
+live by the decoder. To capture a paper-print round-trip:
+
+1. Print the page from PB 1.10 (File → Print).
+2. Scan it back with your own scanner software at ≥ 900 DPI
+   physical resolution.
+3. Save the scanner output as PNG (or any format the `image` crate
+   reads).
+4. Drop in `tests/golden/v1-paperbak/scanned/<name>.scan.png`.
+
+ampaper's decoder doesn't go through PB 1.10 to read these — it
+ingests the scanned image directly via `scan::scan_decode`. PB 1.10
+itself wouldn't be able to read a PNG without a separate BMP
+conversion, but that's PB 1.10's limitation, not ours.
 
 For multi-page captures (input larger than one page), PaperBack 1.10
 emits one BMP per page named `<base>_NNNN.bmp`. Keep them all under the
@@ -97,13 +113,17 @@ so future readers can reproduce.
 | `lorem.input` | Standard 5-sentence Lorem Ipsum (English) | 446 bytes |
 
 Capture workflow for the lorem vector:
-1. Open `lorem.input` in PaperBack 1.10
+1. Open `lorem.input` in PaperBack 1.10 (File → Open input file)
 2. Use the source defaults from above
 3. File → Save bitmap → `lorem.bmp`
-4. Convert to PNG (any tool — `magick lorem.bmp lorem.png`)
-5. Drop a `lorem.txt` with the encoder options and PB 1.10 version
-6. Commit `lorem.png` and `lorem.txt` (the `.bmp` is too large to
-   commit and we don't need it once PNG is saved)
+4. (Optional) Drop a `lorem.txt` with the encoder options and PB
+   1.10 version + checksum used
+5. Commit `lorem.bmp` and (if present) `lorem.txt`
+
+PB 1.10 truncates the bitmap height to fit just the rows the data
+needs (Printer.cpp:817-826) — for a 446-byte input at default
+settings the BMP comes out around 1.5 MB rather than the ~26 MB
+of a full A4 page. Comfortable for a git commit.
 
 ## Future vector matrix
 
@@ -127,8 +147,10 @@ Beyond the lorem starter, expand coverage along these axes:
   public artifacts in a public repo. Use synthetic / public-domain
   inputs only (lorem ipsum, a Project Gutenberg excerpt, `/dev/urandom`
   output committed alongside as the .input).
-- Raw `.bmp` files when a PNG conversion exists — BMPs at typical
-  page sizes are 25+ MB; PNGs of the same content are ~100 KB.
+(no exclusions beyond the personal-data and binary-redistribution
+rules above — BMPs ARE committed directly because PB 1.10's I/O is
+BMP-only and we don't want to introduce a format conversion in the
+ground-truth path.)
 
 ## Why this directory ships in the public repo
 

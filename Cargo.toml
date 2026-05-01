@@ -31,5 +31,10 @@ bzip2 = "0.6.1"
 # they can't drive a printer/scanner from the GUI.
 
 [dev-dependencies]
-# proptest for the encoder/decoder round-trip property tests
-# once the format machinery lands. Kept light to start.
+# image is used by the golden-vector integration tests to read the
+# `.bmp` files PaperBack 1.10 emits and the `.scan.png` files from
+# external scanner software. Default features pull in JPG/TIFF/GIF/
+# WebP decoders we don't need; bmp + png is enough for the test
+# surface. When a runtime `decode_image_path` API lands at M10 it
+# can promote to a regular dependency.
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }

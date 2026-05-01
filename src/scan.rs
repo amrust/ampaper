@@ -747,18 +747,23 @@ pub fn sample_block_at(
             // best CRC match (Decoder.cpp:716-746).
             let bmp_x = dot_x + dot_y * x_angle.angle + shift_x;
             let bmp_y = dot_y + dot_x * y_angle.angle + shift_y;
-            // 2-by-2 averaging mirrors Decoder.cpp:739-743's
-            // dotsize=2 case. Wider windows pick up adjacent dots
-            // (dot pitch is only 3 pixels). For tolerating larger
-            // registration errors from integer-step angle search,
-            // we rely on Reed-Solomon's 16-byte correction running
-            // downstream — see scan_decode where decode8 runs on
-            // every extracted cell before CRC verification.
-            let p00 = u16::from(sample_bilinear(bitmap, w, h, bmp_x, bmp_y));
-            let p01 = u16::from(sample_bilinear(bitmap, w, h, bmp_x + 1.0, bmp_y));
-            let p10 = u16::from(sample_bilinear(bitmap, w, h, bmp_x, bmp_y + 1.0));
-            let p11 = u16::from(sample_bilinear(bitmap, w, h, bmp_x + 1.0, bmp_y + 1.0));
-            let pixel = ((p00 + p01 + p10 + p11) / 4) as u8;
+            // Single bilinear at the dot's predicted center (a
+            // half-pixel offset). When the predicted center sits
+            // between four pixels, bilinear interpolation already
+            // produces the 2x2 average that Decoder.cpp:739-743's
+            // dotsize=2 case computes from integer reads — but
+            // bounded to those 4 pixels, with no spill into the
+            // adjacent dot or gap.
+            //
+            // Wider sampling windows (e.g. four bilinears at +1
+            // offsets) effectively read a 3x3 weighted region, which
+            // spills past dot edges. With dot pitch 3 and dot width
+            // 2, the gap between dots is only 1 pixel — the spill
+            // pulls the average above the black/white threshold for
+            // set dots and the decoder fails. Registration error
+            // from integer-step angle search is handled instead by
+            // the 9-shift sweep in [`sample_block_best_shift`].
+            let pixel = sample_bilinear(bitmap, w, h, bmp_x, bmp_y);
             if pixel < threshold {
                 row |= 1u32 << i;
             }
