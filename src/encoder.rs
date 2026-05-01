@@ -438,7 +438,7 @@ mod tests {
             geometry: *geometry,
             threshold: page::DEFAULT_THRESHOLD,
         };
-        crate::decoder::decode(&bitmaps, &opts).expect("encoded pages must decode in tests")
+        crate::decoder::decode(&bitmaps, &opts, None).expect("encoded pages must decode in tests")
     }
 
     #[test]

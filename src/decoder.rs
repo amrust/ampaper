@@ -26,6 +26,7 @@ use crate::block::{
     Block, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, PBM_ENCRYPTED, SuperBlock,
 };
 use crate::bz;
+use crate::legacy_aes;
 use crate::page::{self, PageGeometry};
 
 /// Decoder configuration. Geometry must match what the encoder used
@@ -65,9 +66,15 @@ pub enum DecodeError {
     /// No SuperBlock survived CRC verification across all input
     /// pages — the decoder has no metadata to drive reassembly.
     NoSuperBlock,
-    /// The SuperBlock asserts encrypted data, which this decoder
-    /// path doesn't handle. Encrypted v1 reads land at M7.
-    EncryptionNotSupported,
+    /// The SuperBlock asserts encrypted data and the caller did not
+    /// pass a password. Re-call `decode` with `Some(password)` once
+    /// the user supplies it.
+    PasswordRequired,
+    /// A password was supplied but the post-decrypt CRC of the
+    /// recovered plaintext does not match `SuperBlock.filecrc`.
+    /// Mirrors `Fileproc.cpp:319-321`'s "Invalid password, please
+    /// try again" check. Caller may retry with a different password.
+    InvalidPassword,
     /// One or more groups have ≥ 2 missing blocks; XOR-checksum
     /// recovery can only fix exactly one missing block per group.
     /// Carries the byte-offset of the first unrecoverable region.
@@ -77,6 +84,11 @@ pub enum DecodeError {
     /// SuperBlock and surfaces this error if any later page's
     /// SuperBlock contradicts it on the load-bearing fields.
     InconsistentSuperBlocks,
+    /// AES decrypt rejected the input — usually a wrong-length
+    /// buffer (e.g. SuperBlock reports a non-16-aligned datasize).
+    /// Distinct from InvalidPassword which fires after a
+    /// successful-but-garbage decrypt.
+    DecryptFailed(legacy_aes::LegacyAesError),
     /// bzip2 decompression failed on the recovered buffer. Usually
     /// means a block went missing in a way recovery couldn't fix
     /// and the resulting buffer is corrupt.
@@ -87,9 +99,12 @@ impl core::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoSuperBlock => f.write_str("no SuperBlock decoded successfully on any page"),
-            Self::EncryptionNotSupported => {
-                f.write_str("SuperBlock asserts PBM_ENCRYPTED; legacy AES-192 read lands at M7")
-            }
+            Self::PasswordRequired => f.write_str(
+                "SuperBlock asserts PBM_ENCRYPTED; pass Some(password) to decode the data",
+            ),
+            Self::InvalidPassword => f.write_str(
+                "post-decrypt CRC mismatch — the supplied password does not match the encoded data",
+            ),
             Self::UnrecoverableGap { offset } => write!(
                 f,
                 "≥2 blocks missing in the group containing byte offset {offset}; \
@@ -99,6 +114,7 @@ impl core::fmt::Display for DecodeError {
                 "SuperBlocks across pages disagree on file metadata; \
                  inputs likely come from different prints",
             ),
+            Self::DecryptFailed(e) => write!(f, "AES-CBC decrypt failed: {e}"),
             Self::BzipFailed(msg) => write!(f, "bzip2 decompression failed: {msg}"),
         }
     }
@@ -124,7 +140,11 @@ impl std::error::Error for DecodeError {}
 ///      and invert the running 0xFF — recovers the missing data.
 ///   6. If `mode & PBM_COMPRESSED`, bzip2-decompress.
 ///   7. Truncate to `origsize` and return.
-pub fn decode(pages: &[Vec<u8>], options: &DecodeOptions) -> Result<Vec<u8>, DecodeError> {
+pub fn decode(
+    pages: &[Vec<u8>],
+    options: &DecodeOptions,
+    password: Option<&[u8]>,
+) -> Result<Vec<u8>, DecodeError> {
     let geometry = &options.geometry;
     let threshold = options.threshold;
 
@@ -132,7 +152,6 @@ pub fn decode(pages: &[Vec<u8>], options: &DecodeOptions) -> Result<Vec<u8>, Dec
     let mut superblock: Option<SuperBlock> = None;
     let mut data_blocks: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
     let mut recovery_blocks: Vec<(u32, u8, [u8; NDATA])> = Vec::new(); // (offset, ngroup, data)
-    let mut any_encrypted = false;
     let mut metadata_inconsistency = false;
 
     for bitmap in pages {
@@ -149,9 +168,6 @@ pub fn decode(pages: &[Vec<u8>], options: &DecodeOptions) -> Result<Vec<u8>, Dec
                 };
                 if !parsed.verify_crc() {
                     continue;
-                }
-                if parsed.mode & PBM_ENCRYPTED != 0 {
-                    any_encrypted = true;
                 }
                 if let Some(existing) = superblock {
                     // Pages must agree on file metadata. Compare the
@@ -179,14 +195,6 @@ pub fn decode(pages: &[Vec<u8>], options: &DecodeOptions) -> Result<Vec<u8>, Dec
         }
     }
 
-    // Encryption is checked first because it's a security-relevant
-    // signal — even a single encrypted SuperBlock copy means the
-    // user's data is in an encryption envelope this decoder can't
-    // handle, and falling through to "looks unencrypted" would risk
-    // emitting ciphertext as plaintext.
-    if any_encrypted {
-        return Err(DecodeError::EncryptionNotSupported);
-    }
     if metadata_inconsistency {
         return Err(DecodeError::InconsistentSuperBlocks);
     }
@@ -288,6 +296,27 @@ pub fn decode(pages: &[Vec<u8>], options: &DecodeOptions) -> Result<Vec<u8>, Dec
         }
     }
 
+    // --- Step 5.5: optional AES-192-CBC decrypt --------------------
+    // Mirrors Fileproc.cpp:292-327. salt + iv live in the upper 32
+    // bytes of SuperBlock.name (FORMAT-V1.md §3.2 / PAPERBAK-HACKS.md
+    // §2.1). After decrypt, recompute Crc16(plaintext) and compare
+    // to SuperBlock.filecrc — that's the password verification.
+    if superblock.mode & PBM_ENCRYPTED != 0 {
+        let password = password.ok_or(DecodeError::PasswordRequired)?;
+        let salt: &[u8; 16] = superblock.name[32..48]
+            .try_into()
+            .expect("16 bytes from a 64-byte slice");
+        let iv: &[u8; 16] = superblock.name[48..64]
+            .try_into()
+            .expect("16 bytes from a 64-byte slice");
+        let key = legacy_aes::derive_key_v1(password, salt);
+        legacy_aes::decrypt_v1_in_place(&mut buf, &key, iv).map_err(DecodeError::DecryptFailed)?;
+        let computed = crate::crc::crc16(&buf);
+        if computed != superblock.filecrc {
+            return Err(DecodeError::InvalidPassword);
+        }
+    }
+
     // --- Step 6-7: optional bzip2 + truncate -----------------------
     if superblock.mode & PBM_COMPRESSED != 0 {
         buf = bz::decompress(&buf).map_err(|e| DecodeError::BzipFailed(e.to_string()))?;
@@ -346,7 +375,7 @@ mod tests {
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
         let pages = encode(&payload, &enc_opts, &meta()).unwrap();
         let bitmaps = pages_to_bitmaps(&pages);
-        let recovered = decode(&bitmaps, &dec_opts).unwrap();
+        let recovered = decode(&bitmaps, &dec_opts, None).unwrap();
         assert_eq!(recovered, payload);
     }
 
@@ -358,7 +387,7 @@ mod tests {
         let pages = encode(&payload, &enc_opts, &meta()).unwrap();
         assert!(pages.len() >= 3, "10000 bytes should require multi-page");
         let bitmaps = pages_to_bitmaps(&pages);
-        let recovered = decode(&bitmaps, &dec_opts).unwrap();
+        let recovered = decode(&bitmaps, &dec_opts, None).unwrap();
         assert_eq!(recovered, payload);
     }
 
@@ -374,7 +403,7 @@ mod tests {
         }
         let pages = encode(&payload, &enc_opts, &meta()).unwrap();
         let bitmaps = pages_to_bitmaps(&pages);
-        let recovered = decode(&bitmaps, &dec_opts).unwrap();
+        let recovered = decode(&bitmaps, &dec_opts, None).unwrap();
         assert_eq!(recovered, payload);
     }
 
@@ -399,7 +428,7 @@ mod tests {
             };
             let pages = encode(&payload, &enc, &meta()).unwrap();
             let bitmaps = pages_to_bitmaps(&pages);
-            let recovered = decode(&bitmaps, &dec).unwrap();
+            let recovered = decode(&bitmaps, &dec, None).unwrap();
             assert_eq!(recovered, payload, "redundancy = {r}");
         }
     }
@@ -434,7 +463,7 @@ mod tests {
             }
         }
 
-        let recovered = decode(&[bitmap], &dec_opts).unwrap();
+        let recovered = decode(&[bitmap], &dec_opts, None).unwrap();
         assert_eq!(
             recovered, payload,
             "decoder failed to recover from one missing data block"
@@ -472,70 +501,170 @@ mod tests {
             }
         }
 
-        let err = decode(&[bitmap], &dec_opts).unwrap_err();
+        let err = decode(&[bitmap], &dec_opts, None).unwrap_err();
         assert!(
             matches!(err, DecodeError::UnrecoverableGap { .. }),
             "expected UnrecoverableGap, got {err:?}"
         );
     }
 
-    /// Encrypted SuperBlocks must surface as EncryptionNotSupported
-    /// rather than silently producing garbage. The encoder doesn't
-    /// emit encrypted output yet, but we can fake a bitmap whose
-    /// SuperBlock has PBM_ENCRYPTED set to exercise the rejection path.
-    #[test]
-    fn rejects_encrypted_data() {
+    /// Build a fully-encrypted single-page bitmap from `plaintext`
+    /// with the given password, salt, and iv. Mirrors the relevant
+    /// parts of PaperBack 1.10's `Printer.cpp:444-498` + page render
+    /// without exposing v1 forward-AES from the encoder API. Returns
+    /// (page bitmap, geometry) for feeding to decode/scan_decode.
+    fn build_encrypted_page(
+        plaintext: &[u8],
+        password: &[u8],
+        salt: &[u8; 16],
+        iv: &[u8; 16],
+    ) -> (Vec<u8>, page::PageGeometry) {
+        use crate::block::{Block, ECC_BYTES, NDATA, PBM_ENCRYPTED, SUPERBLOCK_ADDR, SuperBlock};
+        use crate::legacy_aes;
+
         let geometry = small_geometry();
-        let (enc_opts, dec_opts) = encode_decode_options(geometry);
-        let pages = encode(b"hi", &enc_opts, &meta()).unwrap();
-        let mut bitmap = pages[0].bitmap.clone();
 
-        // Find a SuperBlock cell, flip its mode byte to add PBM_ENCRYPTED,
-        // recompute CRC and ECC, and write the cell back.
-        let cells = page::extract(&geometry, &bitmap, dec_opts.threshold);
-        let mut faked = false;
-        for (cell_index, cell_bytes) in cells.iter().enumerate() {
-            if let Ok(mut s) = SuperBlock::from_bytes(cell_bytes)
-                && s.verify_crc()
-            {
-                s.mode |= PBM_ENCRYPTED;
-                s.crc = s.compute_crc();
-                s.ecc = s.compute_ecc();
-                let new_bytes = s.to_bytes();
-                let placed = page::PlacedBlock {
-                    cell_index: cell_index as u32,
-                    bytes: new_bytes,
-                };
-                // Repaint just this one cell. We can't easily call
-                // page::render for a single cell, so paint the cell
-                // white first then re-render the page with the new
-                // SuperBlock copies in addition to existing blocks.
-                // Simpler: paint the cell white and re-render the
-                // single-cell update by hand via a helper.
-                let _ = placed; // unused — fall back to full re-render below
-                let mut rerender_blocks = Vec::new();
-                for (idx, original_cell) in cells.iter().enumerate() {
-                    let block = Block::from_bytes(original_cell);
-                    if block.is_super() && idx == cell_index {
-                        rerender_blocks.push(page::PlacedBlock {
-                            cell_index: idx as u32,
-                            bytes: new_bytes,
-                        });
-                    } else {
-                        rerender_blocks.push(page::PlacedBlock {
-                            cell_index: idx as u32,
-                            bytes: *original_cell,
-                        });
-                    }
-                }
-                bitmap = page::render(&geometry, &rerender_blocks, page::BLACK_PAPER);
-                faked = true;
-                break;
-            }
+        // Pad plaintext to 16 bytes (Printer.cpp:417-420). Encrypt
+        // in place via the test-only helper.
+        let aligned_len = (plaintext.len() + 15) & !15;
+        let mut buf = vec![0u8; aligned_len];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let filecrc = crate::crc::crc16(&buf);
+        let key = legacy_aes::derive_key_v1(password, salt);
+        legacy_aes::encrypt_v1_in_place_for_testing(&mut buf, &key, iv);
+
+        // Build SuperBlock with name[32..48] = salt, name[48..64] = iv
+        // per FORMAT-V1.md §3.2.
+        let mut name = [0u8; 64];
+        name[..7].copy_from_slice(b"enc.bin");
+        name[32..48].copy_from_slice(salt);
+        name[48..64].copy_from_slice(iv);
+        let pagesize = aligned_len as u32;
+        let datasize = aligned_len as u32;
+        let origsize = plaintext.len() as u32;
+        let mut sb = SuperBlock {
+            datasize,
+            pagesize,
+            origsize,
+            mode: PBM_ENCRYPTED,
+            attributes: 0x80,
+            page: 1,
+            modified: 0,
+            filecrc,
+            name,
+            crc: 0,
+            ecc: [0; ECC_BYTES],
+        };
+        sb.crc = sb.compute_crc();
+        sb.ecc = sb.compute_ecc();
+        let sb_bytes = sb.to_bytes();
+
+        // Build data blocks: split buf into NDATA chunks, each with
+        // its byte offset as the addr field.
+        let mut placed: Vec<page::PlacedBlock> = Vec::new();
+        let n_data = aligned_len.div_ceil(NDATA);
+        let nstring = 1u32; // single group; small payload
+        let redundancy = 5u32;
+        // Simple layout for the test: cell 0 = SuperBlock, cells
+        // 1..=n_data = data blocks, then the rest is filler SuperBlocks.
+        // This doesn't replicate Printer.cpp's exact rotation formula
+        // but it produces a valid bitmap whose SuperBlock points to
+        // the encrypted data — enough to exercise decode's encrypt
+        // path. (The full layout test happens in encoder.rs.)
+        let _ = (nstring, redundancy); // silence unused-var lints
+        placed.push(page::PlacedBlock {
+            cell_index: 0,
+            bytes: sb_bytes,
+        });
+        for i in 0..n_data {
+            let off = i * NDATA;
+            let take = (aligned_len - off).min(NDATA);
+            let mut data = [0u8; NDATA];
+            data[..take].copy_from_slice(&buf[off..off + take]);
+            let mut block = Block {
+                addr: off as u32,
+                data,
+                crc: 0,
+                ecc: [0; ECC_BYTES],
+            };
+            block.crc = block.compute_crc();
+            block.ecc = block.compute_ecc();
+            placed.push(page::PlacedBlock {
+                cell_index: (i + 1) as u32,
+                bytes: block.to_bytes(),
+            });
         }
-        assert!(faked, "could not find a SuperBlock to fake encryption on");
+        // Fill remaining cells with extra SuperBlock copies so the
+        // decoder's "any SuperBlock seen" check has plenty of CRC-
+        // verified candidates regardless of which cells the scanner
+        // happens to read cleanly.
+        let total_cells = geometry.nx() * geometry.ny();
+        for cell in (n_data + 1) as u32..total_cells {
+            // Skip cells that conflict with placed addrs.
+            if placed.iter().any(|p| p.cell_index == cell) {
+                continue;
+            }
+            placed.push(page::PlacedBlock {
+                cell_index: cell,
+                bytes: sb_bytes,
+            });
+        }
 
-        let err = decode(&[bitmap], &dec_opts).unwrap_err();
-        assert_eq!(err, DecodeError::EncryptionNotSupported);
+        let bitmap = page::render(&geometry, &placed, page::BLACK_PAPER);
+        // crate::block::SUPERBLOCK_ADDR is referenced via name[..]
+        // path; silence dead-imports warning if any.
+        let _ = SUPERBLOCK_ADDR;
+        (bitmap, geometry)
+    }
+
+    /// Encrypted page round-trip: decode with the right password
+    /// recovers the plaintext byte-for-byte.
+    #[test]
+    fn encrypted_page_round_trips_with_correct_password() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog";
+        let password = b"correct horse battery staple";
+        let salt = [0x42u8; 16];
+        let iv = [0x99u8; 16];
+        let (bitmap, geometry) = build_encrypted_page(plaintext, password, &salt, &iv);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let recovered = decode(&[bitmap], &opts, Some(password))
+            .expect("decode with correct password must succeed");
+        assert_eq!(recovered, plaintext);
+    }
+
+    /// No password supplied for an encrypted page → PasswordRequired.
+    #[test]
+    fn encrypted_page_without_password_is_password_required() {
+        let plaintext = b"secrets need passwords";
+        let password = b"swordfish";
+        let salt = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let (bitmap, geometry) = build_encrypted_page(plaintext, password, &salt, &iv);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&[bitmap], &opts, None).unwrap_err();
+        assert_eq!(err, DecodeError::PasswordRequired);
+    }
+
+    /// Wrong password → InvalidPassword (post-decrypt CRC mismatch).
+    /// This is the user-friendly distinction from PasswordRequired.
+    #[test]
+    fn encrypted_page_with_wrong_password_is_invalid_password() {
+        let plaintext = b"secrets need passwords";
+        let password = b"swordfish";
+        let salt = [0x33u8; 16];
+        let iv = [0x44u8; 16];
+        let (bitmap, geometry) = build_encrypted_page(plaintext, password, &salt, &iv);
+        let opts = DecodeOptions {
+            geometry,
+            threshold: page::DEFAULT_THRESHOLD,
+        };
+        let err = decode(&[bitmap], &opts, Some(b"wrong password")).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidPassword);
     }
 }

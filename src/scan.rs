@@ -926,7 +926,10 @@ pub fn scan_extract(
 ///
 /// Each input is `(bitmap_bytes, width, height)`. Returns the
 /// original input bytes on success.
-pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decoder::DecodeError> {
+pub fn scan_decode(
+    pages: &[(&[u8], u32, u32)],
+    password: Option<&[u8]>,
+) -> Result<Vec<u8>, crate::decoder::DecodeError> {
     use crate::block::{
         Block, NDATA, NGROUP_MAX, NGROUP_MIN, PBM_COMPRESSED, PBM_ENCRYPTED, SuperBlock,
     };
@@ -935,7 +938,6 @@ pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decode
     let mut superblock: Option<SuperBlock> = None;
     let mut data_blocks: std::collections::BTreeMap<u32, [u8; NDATA]> = Default::default();
     let mut recovery_blocks: Vec<(u32, u8, [u8; NDATA])> = Vec::new();
-    let mut any_encrypted = false;
     let mut metadata_inconsistency = false;
 
     for &(bitmap, width, height) in pages {
@@ -954,9 +956,6 @@ pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decode
                 };
                 if !parsed.verify_crc() {
                     continue;
-                }
-                if parsed.mode & PBM_ENCRYPTED != 0 {
-                    any_encrypted = true;
                 }
                 if let Some(existing) = superblock {
                     if existing.datasize != parsed.datasize
@@ -981,9 +980,6 @@ pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decode
         }
     }
 
-    if any_encrypted {
-        return Err(DecodeError::EncryptionNotSupported);
-    }
     if metadata_inconsistency {
         return Err(DecodeError::InconsistentSuperBlocks);
     }
@@ -1050,6 +1046,23 @@ pub fn scan_decode(pages: &[(&[u8], u32, u32)]) -> Result<Vec<u8>, crate::decode
             return Err(DecodeError::UnrecoverableGap {
                 offset: (i * NDATA) as u32,
             });
+        }
+    }
+    // Optional AES-192-CBC decrypt; same shape as crate::decoder::decode.
+    if superblock.mode & PBM_ENCRYPTED != 0 {
+        let password = password.ok_or(DecodeError::PasswordRequired)?;
+        let salt: &[u8; 16] = superblock.name[32..48]
+            .try_into()
+            .expect("16 bytes from a 64-byte slice");
+        let iv: &[u8; 16] = superblock.name[48..64]
+            .try_into()
+            .expect("16 bytes from a 64-byte slice");
+        let key = crate::legacy_aes::derive_key_v1(password, salt);
+        crate::legacy_aes::decrypt_v1_in_place(&mut buf, &key, iv)
+            .map_err(DecodeError::DecryptFailed)?;
+        let computed = crate::crc::crc16(&buf);
+        if computed != superblock.filecrc {
+            return Err(DecodeError::InvalidPassword);
         }
     }
     if superblock.mode & PBM_COMPRESSED != 0 {
@@ -1315,7 +1328,7 @@ mod tests {
     fn scan_decode_round_trip_unrotated() {
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
         let (bitmap, w, h) = encode_payload(&payload);
-        let recovered = scan_decode(&[(&bitmap, w, h)]).unwrap();
+        let recovered = scan_decode(&[(&bitmap, w, h)], None).unwrap();
         assert_eq!(recovered, payload);
     }
 
@@ -1329,7 +1342,7 @@ mod tests {
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
         let (bitmap, w, h) = encode_payload(&payload);
         let rotated = rotate_bitmap(&bitmap, w, h, 0.01);
-        let recovered = scan_decode(&[(&rotated, w, h)]).unwrap();
+        let recovered = scan_decode(&[(&rotated, w, h)], None).unwrap();
         assert_eq!(recovered, payload);
     }
 
@@ -1342,7 +1355,7 @@ mod tests {
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 31) as u8).collect();
         let (bitmap, w, h) = encode_payload(&payload);
         let noisy = noisy_bitmap(&bitmap, 30, 0xAA55_DEAD_BEEF_F00D);
-        let recovered = scan_decode(&[(&noisy, w, h)]).unwrap();
+        let recovered = scan_decode(&[(&noisy, w, h)], None).unwrap();
         assert_eq!(recovered, payload);
     }
 

@@ -52,8 +52,8 @@ fn lorem_paperbak_v110_bmp_decodes_to_input_bytes() {
     let (pixels, w, h) = load_grayscale(&bmp_path);
     let input = std::fs::read(dir.join("lorem.input")).expect("lorem.input must exist");
 
-    let recovered =
-        scan_decode(&[(&pixels, w, h)]).expect("scan_decode must succeed on a valid PB 1.10 BMP");
+    let recovered = scan_decode(&[(&pixels, w, h)], None)
+        .expect("scan_decode must succeed on a valid PB 1.10 BMP");
 
     assert_eq!(
         recovered,

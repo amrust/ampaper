@@ -12,5 +12,6 @@ pub mod decoder;
 pub mod dot_grid;
 pub mod ecc;
 pub mod encoder;
+pub mod legacy_aes;
 pub mod page;
 pub mod scan;

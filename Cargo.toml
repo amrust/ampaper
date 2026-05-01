@@ -18,9 +18,22 @@ rust-version = "1.85"
 # Round-trip tests cross-check against the `bzip2` CLI for that
 # reason (see src/bz.rs tests).
 bzip2 = "0.6.1"
-# Other deps (image for PNG I/O, aes for legacy + forward crypto,
-# windows-rs for GDI / WIA / TWAIN) land at the milestone that
-# needs them. See docs/MILESTONES.md for the staging order.
+
+# RustCrypto stack for legacy AES-192-CBC read (M7) — see
+# docs/FORMAT-V1.md §6.3 and src/legacy_aes.rs. PB 1.10 derives
+# the AES key via PBKDF2-HMAC-SHA-1 (Brian Gladman's pwd2key
+# default), 524288 iterations, 16-byte salt; the AES mode is
+# CBC with a 16-byte IV stored alongside the salt in the
+# SuperBlock's name[] field. Forward AES-192 write is NOT
+# part of M7 and these crates only ship decryption code.
+aes = "0.9"
+cbc = "0.2"
+pbkdf2 = "0.13"
+sha1 = "0.11"
+
+# Other deps (windows-rs for GDI / WIA / TWAIN at M9/M10) land
+# at the milestone that needs them. See docs/MILESTONES.md for
+# the staging order.
 
 [target.'cfg(windows)'.dependencies]
 # GUI + printing + scanning lives behind cfg(windows) for now.

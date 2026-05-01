@@ -15,13 +15,37 @@ The list reflects `Cargo.lock` at commit time. Run
 |---|---|---|
 | `bzip2` | 0.6 | MIT OR Apache-2.0 |
 | `libbz2-rs-sys` | 0.2 | bzip2-1.0.6 |
+| `aes` | 0.9 | MIT OR Apache-2.0 |
+| `cbc` | 0.2 | MIT OR Apache-2.0 |
+| `pbkdf2` | 0.13 | MIT OR Apache-2.0 |
+| `sha1` | 0.11 | MIT OR Apache-2.0 |
+| `hmac` | 0.13 | MIT OR Apache-2.0 |
+| `cipher` | 0.5 | MIT OR Apache-2.0 |
+| `digest` | 0.11 | MIT OR Apache-2.0 |
+| `block-buffer` | 1 | MIT OR Apache-2.0 |
+| `crypto-common` | 0.2 | MIT OR Apache-2.0 |
+| `inout` | 0.2 | MIT OR Apache-2.0 |
+| `hybrid-array` | 0.4 | MIT OR Apache-2.0 |
+| `cpufeatures` | 0.3 | MIT OR Apache-2.0 |
+| `cpubits` | 0.1 | MIT OR Apache-2.0 |
+| `cmov` | 0.5 | Apache-2.0 OR MIT |
+| `ctutils` | 0.4 | Apache-2.0 OR MIT |
+| `const-oid` | 0.10 | Apache-2.0 OR MIT |
+| `typenum` | 1 | MIT OR Apache-2.0 |
+| `libc` | 0.2 | MIT OR Apache-2.0 |
 
 `bzip2-1.0.6` is Julian R. Seward's original libbzip2 license — a
 BSD-style permissive grant covering the algorithm and reference
 implementation. `libbz2-rs-sys` is a pure-Rust reimplementation
-distributed under that same terms; see
+distributed under those same terms; see
 <https://github.com/trifectatechfoundation/libbzip2-rs>. FSF lists
 the libbzip2 license as GPL-compatible.
+
+The `aes` / `cbc` / `pbkdf2` / `sha1` / `hmac` / supporting crates
+are the [RustCrypto](https://github.com/RustCrypto) project's
+modular cipher stack. They land at M7 to power legacy AES-192 read
+(see `src/legacy_aes.rs`); they will also serve as the AES-256-GCM
+forward write path's primitive layer at M11.
 
 ## Test-only dependencies
 
