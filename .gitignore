@@ -21,6 +21,10 @@ Thumbs.db
 /tmp
 *.log
 
+# .vscode tasks.json redirect target — captures GUI stdout/stderr
+# from Ctrl+Shift+B. Local dev artefact, not ground truth.
+/swaplog.txt
+
 # Reference vendoring (the original paperbak-1.10.src and the
 # mrpods checkout sit under /reference/ when present, but we do
 # NOT ship them in our repo — they are read-only ground truth
