@@ -9,6 +9,7 @@
 
 mod app;
 mod views;
+mod worker;
 
 use app::AmpaperApp;
 
