@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::worker::{
-    CellStatus, DecodeJob, DecodeMessage, DecodePage, DecodeRequest, PageReport,
+    CellStatus, DEFAULT_PDF_RENDER_DPI, DecodeJob, DecodeMessage, DecodePage, DecodeRequest,
+    PageReport, looks_like_pdf, render_pdf_pages,
 };
 
 #[derive(Default)]
@@ -55,9 +56,13 @@ impl DecodeView {
         ui.heading("Decode");
         ui.add_space(6.0);
         ui.label(
-            "Drag one or more scanned bitmaps into this window, or click \
-             \"Open files...\" Reads PaperBack 1.10 v1 prints (incl. legacy \
-             AES-192) and ampaper v2 (AES-256-GCM) automatically.",
+            "Drag one or more scanned bitmaps or PDFs into this window, or \
+             click \"Open files...\" Reads PaperBack 1.10 v1 prints (incl. \
+             legacy AES-192) and ampaper v2 (AES-256-GCM) automatically. \
+             For PDF input, place pdfium.dll (Windows) / libpdfium.so \
+             (Linux) / libpdfium.dylib (macOS) next to the ampaper \
+             executable — pre-built binaries at \
+             github.com/bblanchon/pdfium-binaries.",
         );
         ui.add_space(12.0);
         ui.separator();
@@ -114,7 +119,7 @@ impl DecodeView {
         ui.horizontal(|ui| {
             if ui.button("Open files...").clicked()
                 && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Bitmap", &["bmp", "png", "jpg", "jpeg"])
+                    .add_filter("Image or PDF", &["bmp", "png", "jpg", "jpeg", "pdf"])
                     .pick_files()
             {
                 self.queued_paths = paths;
@@ -168,13 +173,13 @@ impl DecodeView {
 
         let mut pages = Vec::with_capacity(self.queued_paths.len());
         for path in &self.queued_paths {
-            match load_grayscale(path) {
-                Ok((luma, w, h)) => pages.push(DecodePage {
-                    source: path.clone(),
-                    luma,
-                    width: w,
-                    height: h,
-                }),
+            // Sniff the first few bytes to decide between image
+            // decoding (image crate) and PDF rasterization (pdfium).
+            // PDF inputs become one DecodePage per PDF page; image
+            // inputs always become one DecodePage. The user can mix
+            // and match within a single drop.
+            match load_input(path) {
+                Ok(loaded) => pages.extend(loaded),
                 Err(e) => {
                     self.last_status = format!("Failed to load {}: {e}", path.display());
                     return;
@@ -344,12 +349,33 @@ fn paint_grid(ui: &mut egui::Ui, report: &PageReport) {
     }
 }
 
-/// Decode an image file from disk into an 8-bit grayscale bitmap.
-/// Accepts BMP, PNG, JPG (whichever the `image` crate's enabled
-/// features cover). Returns (luma_pixels, width, height).
-fn load_grayscale(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
+/// Load any supported input — BMP/PNG/JPG via the `image` crate, OR
+/// PDF via PDFium — into one or more [`DecodePage`]s. Image inputs
+/// always produce a single page; PDF inputs produce one page per
+/// embedded PDF page (rendered at [`DEFAULT_PDF_RENDER_DPI`]).
+///
+/// PDF detection is done by reading the first ~8 bytes off disk and
+/// checking for the `%PDF-` magic — same trick the file(1) command
+/// uses. We avoid spinning up pdfium for non-PDF files.
+fn load_input(path: &std::path::Path) -> Result<Vec<DecodePage>, String> {
+    let mut sniff = [0u8; 8];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut sniff)
+        })
+        .map_err(|e| format!("{e}"))?;
+    if looks_like_pdf(&sniff[..n]) {
+        return render_pdf_pages(path, DEFAULT_PDF_RENDER_DPI);
+    }
+    // Plain image. Decode and wrap in a single DecodePage.
     let img = image::open(path).map_err(|e| format!("{e}"))?;
     let luma = img.to_luma8();
     let (w, h) = luma.dimensions();
-    Ok((luma.into_raw(), w, h))
+    Ok(vec![DecodePage {
+        source: path.to_path_buf(),
+        luma: luma.into_raw(),
+        width: w,
+        height: h,
+    }])
 }

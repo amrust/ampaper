@@ -74,6 +74,30 @@ image = { version = "0.25", default-features = false, features = ["bmp", "png", 
 # so no per-format decoder feature (bmp/png/jpeg/...) is needed.
 printpdf = { version = "0.9", default-features = false, features = ["images"] }
 
+# PDF input on the Decode tab. pdfium-render wraps Google's PDFium
+# (the renderer Chrome uses) — Apache-2.0 / BSD-3-Clause, and the
+# Rust crate is MIT/Apache-2.0. This is a runtime-loaded dep:
+# Pdfium::default() looks for pdfium.dll / libpdfium.so / libpdfium.dylib
+# next to the executable first, then falls back to system paths.
+# When the library can't be found, the load returns an error and we
+# surface a clear "install pdfium" message — pdfium is NOT bundled
+# in the cargo build.
+#
+# Why a native lib at all: pure-Rust PDF rendering can't handle the
+# diversity of real-world scanner PDFs (JPEG2000 streams, CCITT
+# fax-encoded mono pages, JPX color, transparency groups). PDFium
+# is the same engine Chrome / Edge / Firefox PDF.js's fallback /
+# every commercial PDF SDK uses; it Just Works on any PDF a scanner
+# can produce.
+#
+# We pin features explicitly: image_025 to match our existing image
+# dep, drop thread_safe (we use pdfium from a single worker thread).
+pdfium-render = { version = "0.9", default-features = false, features = [
+    "image_025",
+    "image_api",
+    "pdfium_latest",
+] }
+
 # Convenience for spawning blocking codec jobs onto a worker thread.
 # eframe's `Context::request_repaint_after` lets us drive UI updates
 # from the worker thread without polling.

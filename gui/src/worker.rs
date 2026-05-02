@@ -22,6 +22,7 @@ use ampaper::format_v2::{
     V2_SUPERBLOCK_ADDR_CELL1, V2_SUPERBLOCK_ADDR_CELL2, V2SuperBlockCell1,
 };
 use ampaper::scan::{ScanGeometry, detect_geometry, scan_decode, scan_extract};
+use pdfium_render::prelude::{PdfRenderConfig, Pdfium, PdfiumError};
 
 /// Snapshot of an encode request, populated from the UI when the
 /// user clicks "Encode."
@@ -408,4 +409,135 @@ fn classify_cell(cell: &[u8; ampaper::block::BLOCK_BYTES]) -> CellStatus {
             }
         }
     }
+}
+
+// ====================================================================
+// PDF rasterization (Decode tab)
+// ====================================================================
+//
+// Real-world scanner PDFs embed JPEG / JPEG2000 / CCITT-fax-encoded
+// page images, sometimes with multiple image layers per page. To
+// decode those we render via PDFium, the same engine Chrome uses —
+// far more robust than any pure-Rust PDF renderer for arbitrary
+// scanner output. PDFium itself is dynamically loaded at runtime via
+// libloading; we ship the binary alongside ampaper-gui (or fall back
+// to a system-installed copy).
+//
+// Render DPI: we default to 600. The user encoded at some printer
+// DPI (typically 600); rendering the PDF at that DPI gives us a
+// pixel grid tight enough that each ~3-pixel ampaper dot is well-
+// resolved. Rendering at lower DPI (e.g., 200, the scanner's native)
+// can collapse adjacent dots and break scan_decode's grid finder.
+
+/// Default DPI for PDF page rasterization on the Decode path. We
+/// render at 1200 DPI (typically 2× the encode DPI) so any sub-
+/// pixel drift introduced by the inches → mm → inches roundtrip
+/// inside the PDF page-size encoding doesn't push ampaper dots
+/// across pixel boundaries. scan_decode's grid detector handles
+/// integer-pixel shifts cleanly when each dot is at least ~6
+/// pixels wide. For scanner-output PDFs (typically 200–300 DPI
+/// native), 1200 also oversamples enough that the dot pattern
+/// the scanner captured stays readable.
+pub const DEFAULT_PDF_RENDER_DPI: u32 = 1200;
+
+/// Try to bind to a Pdfium library, looking next to the running
+/// executable first then falling back to system paths. Returns
+/// `Result` instead of panicking the way `Pdfium::default()` does
+/// — the worker surfaces this as an error message in the status bar
+/// rather than crashing the GUI.
+fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
+    // Look for pdfium next to the current exe (the typical
+    // distribution path) before falling back to system paths.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        let candidate = Pdfium::pdfium_platform_library_name_at_path(&dir);
+        if let Ok(b) = Pdfium::bind_to_library(&candidate) {
+            return Ok(Pdfium::new(b));
+        }
+    }
+    // Fallback: cwd, then system.
+    let cwd_candidate = Pdfium::pdfium_platform_library_name_at_path("./");
+    if let Ok(b) = Pdfium::bind_to_library(&cwd_candidate) {
+        return Ok(Pdfium::new(b));
+    }
+    let system = Pdfium::bind_to_system_library()?;
+    Ok(Pdfium::new(system))
+}
+
+/// True when `bytes` start with the `%PDF-` magic that every PDF
+/// 1.x / 2.x file begins with. Quick check before we spin up
+/// pdfium, which is heavy and can fail in non-PDF-specific ways.
+pub fn looks_like_pdf(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"%PDF-")
+}
+
+/// Render every page of `pdf_path` to an 8-bit grayscale bitmap at
+/// `dpi` and return them as [`DecodePage`]s ready to feed into
+/// [`DecodeJob::spawn`].
+///
+/// `Pdfium::default()` looks for the pdfium dynamic library next to
+/// the running executable first, then in standard system paths.
+/// When neither succeeds (e.g., the user hasn't placed pdfium.dll
+/// alongside ampaper-gui.exe yet), we surface a clear error rather
+/// than crashing.
+pub fn render_pdf_pages(pdf_path: &std::path::Path, dpi: u32) -> Result<Vec<DecodePage>, String> {
+    if dpi == 0 {
+        return Err("DPI must be > 0".into());
+    }
+    let pdfium = bind_pdfium().map_err(|e| {
+        format!(
+            "PDFium library not found ({e}). \
+             Place pdfium.dll (Windows) / libpdfium.so (Linux) / \
+             libpdfium.dylib (macOS) next to the executable, or install \
+             it system-wide. Pre-built binaries: \
+             https://github.com/bblanchon/pdfium-binaries/releases"
+        )
+    })?;
+    let document = pdfium
+        .load_pdf_from_file(pdf_path, None)
+        .map_err(|e| format!("PDFium failed to open {}: {e}", pdf_path.display()))?;
+
+    let mut out = Vec::new();
+    for page in document.pages().iter() {
+        // Render at the requested DPI: PDF page size is in points
+        // (1/72 inch), so width_px = page_width_in_inches * dpi.
+        let width_in = page.width().value / 72.0;
+        let height_in = page.height().value / 72.0;
+        let target_w = (width_in * dpi as f32).round().max(1.0) as i32;
+        let target_h = (height_in * dpi as f32).round().max(1.0) as i32;
+
+        // Disable PDFium's default anti-aliasing. We're rendering a
+        // high-contrast dot pattern; smoothing blends adjacent dots
+        // into 50%-grey pixels that scan_decode can't classify
+        // cleanly (RS recovers single-byte errors but not whole-
+        // block fuzz). Pixel-perfect black/white is what the codec
+        // designed for, and the scanner-output use case prefers
+        // sharp source over screen-readable smoothing too.
+        let config = PdfRenderConfig::new()
+            .set_target_width(target_w)
+            .set_target_height(target_h)
+            .set_image_smoothing(false)
+            .set_path_smoothing(false)
+            .set_text_smoothing(false);
+        let bitmap = page
+            .render_with_config(&config)
+            .map_err(|e| format!("PDFium failed to render page: {e}"))?;
+        let dyn_image = bitmap
+            .as_image()
+            .map_err(|e| format!("PDFium bitmap → image conversion failed: {e}"))?;
+        let luma = dyn_image.to_luma8();
+        let (w, h) = luma.dimensions();
+        out.push(DecodePage {
+            source: pdf_path.to_path_buf(),
+            luma: luma.into_raw(),
+            width: w,
+            height: h,
+        });
+    }
+    if out.is_empty() {
+        return Err(format!("PDF has no pages: {}", pdf_path.display()));
+    }
+    Ok(out)
 }
