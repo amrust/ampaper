@@ -211,16 +211,26 @@ impl core::fmt::Display for PrintError {
 impl std::error::Error for PrintError {}
 
 /// Re-derive a `PageGeometry` whose `nx`/`ny` are just big enough
-/// for the cells the data actually needs. The encoder then produces
-/// a tight bitmap with the sync raster wrapping the data block area
-/// (instead of wrapping a full Letter page of mostly-blank cells).
+/// for the cells the data actually needs. Two regimes:
 ///
-/// Used by the PDF save path on raw inputs — runs a quick "trial
-/// encode" to learn how many cells the data takes, computes the
-/// required bitmap dimensions, and returns a geometry the real
-/// encode pass uses. Belt-and-suspenders: we still feed
-/// pad_to_full_page=false so the trial encode places only the
-/// cells it needs.
+/// 1. **Single-page payload** (cells fit on one full Letter page at
+///    the chosen density): shrink to a tight, square-ish bitmap with
+///    `nx = redundancy+1` (smallest valid width) and just enough
+///    rows for the cells. `auto_blocks_per_inch` already picked a
+///    floor density for small inputs, so the cells themselves are
+///    big — the bitmap looks dense even with few cells, and gets
+///    centered nicely on the PDF page with comfortable margins.
+///
+/// 2. **Multi-page payload** (cells don't fit on one page at the
+///    chosen density): keep the full geometry. The encoder
+///    paginates naturally — each page bitmap is full Letter and
+///    cells fill left-to-right, wrapping top-to-bottom, just like
+///    PB 1.10's print layout. Without this branch we'd shrink to a
+///    tall narrow column; the PDF layer would clip those long
+///    bitmaps to Letter, hiding most of the data on every page.
+///
+/// We still feed `pad_to_full_page = false` so unused trailing
+/// cells render as blank paper (no filler superblock copies).
 fn shrink_geometry_to_data(
     geometry: &ampaper::page::PageGeometry,
     data_len_bytes: usize,
@@ -247,14 +257,24 @@ fn shrink_geometry_to_data(
     let strings = r + 1;
     let total_cells = strings * cells_per_string;
 
-    // Lay the cells out at most `nx_max` columns wide so they form
-    // a short, page-shaped rectangle, and respect the encoder's
-    // minimum-page-size guards (redundancy+1 cols, 3 rows,
-    // 2*redundancy+2 cells). Pick nx = redundancy+1 — the smallest
-    // valid width — and ny = max(3, ceil(total / nx)) so the
-    // bitmap is roughly square-ish for small inputs and grows in
-    // height as the payload gets bigger.
     let nx_max = geometry.nx().max(1) as usize;
+    let ny_max = geometry.ny().max(1) as usize;
+    let cells_per_full_page = nx_max * ny_max;
+
+    // Multi-page case: keep the full Letter geometry. The encoder
+    // produces N page-shaped bitmaps with cells filling left-to-
+    // right and wrapping top-to-bottom; the PDF layer centers each
+    // on a Letter sheet without clipping. Avoids the
+    // tall-narrow-column failure mode where shrinking a multi-page
+    // payload to nx_min produced bitmaps far taller than 11" that
+    // the PDF clipped to nothing.
+    if total_cells > cells_per_full_page {
+        return *geometry;
+    }
+
+    // Single-page case: shrink to a tight bitmap. nx = redundancy+1
+    // is the encoder's minimum, ny = max(3, ceil(total/nx)) keeps
+    // it square-ish for small inputs.
     let nx_min = r + 1;
     let nx = nx_min.min(nx_max).max(nx_min);
     let ny_min_for_cells = total_cells.div_ceil(nx);

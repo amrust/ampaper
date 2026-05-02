@@ -249,3 +249,87 @@ fn print_tab_encodes_pdf_input_as_data_not_passthrough() {
         );
     }
 }
+
+#[test]
+fn print_tab_multi_page_payload_fills_pages_left_to_right_not_narrow_column() {
+    // Regression: dropping a file too big to fit on one page used
+    // to produce tall narrow column bitmaps (nx = redundancy+1 = 6
+    // cells wide, hundreds of cells tall) that the PDF layer
+    // clipped to Letter — most of the data ended up below the
+    // visible page area, and the user saw a thin vertical strip
+    // with mostly-empty trailing pages. Now multi-page payloads
+    // skip the shrink and use the full Letter geometry, so each
+    // page bitmap is page-shaped (cells wrap left-to-right).
+    let tmp = std::env::temp_dir().join("ampaper-gui-print-multipage");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Build a payload large enough to need multiple pages at the
+    // Normal preset's 100 dot/in target on Letter at 600 ppi.
+    // ~50 KB of incompressible bytes well exceeds one page's
+    // ~50 KB capacity at that density, forcing multi-page output.
+    let mut payload = Vec::with_capacity(80_000);
+    let mut x: u32 = 0x9E37_79B1;
+    for _ in 0..80_000 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        payload.push((x >> 16) as u8);
+    }
+    let raw_path = tmp.join("big.bin");
+    std::fs::write(&raw_path, &payload).unwrap();
+
+    // Letter geometry — same as the GUI's encode_options_from_settings.
+    let opts = EncodeOptions {
+        geometry: PageGeometry {
+            ppix: 600,
+            ppiy: 600,
+            dpi: 100, // placeholder; auto_blocks_per_inch overrides
+            dot_percent: 70,
+            width: (8.5 * 600.0) as u32,
+            height: (11.0 * 600.0) as u32,
+            print_border: true,
+        },
+        redundancy: NGROUP_DEFAULT,
+        compress: false,
+        black: BLACK_PAPER,
+        pad_to_full_page: false,
+    };
+
+    let pages = prepare_print_pages(
+        std::slice::from_ref(&raw_path),
+        &opts,
+        QualityPreset::Normal,
+        None,
+    )
+    .expect("multi-page encode should succeed");
+    assert!(
+        pages.len() >= 2,
+        "80 KB at Normal/100-dpi should span ≥2 pages, got {}",
+        pages.len()
+    );
+
+    // Each page bitmap should be page-shaped (wider than tall, or
+    // close to it) — not the tall narrow column the old shrink
+    // produced. Failure mode of the bug: width ~1370 px, height
+    // ~50000+ px (aspect ratio 0.027). Healthy multi-page output:
+    // width ~5100, height ~6600 (aspect ratio 0.77).
+    for (i, page) in pages.iter().enumerate() {
+        let aspect = page.width as f32 / page.height as f32;
+        assert!(
+            aspect > 0.4,
+            "page {i}: bitmap {}x{} is a tall narrow column (aspect {:.3}); \
+             multi-page output should fill Letter pages left-to-right \
+             (regression of the tekscan.pdf bug)",
+            page.width,
+            page.height,
+            aspect,
+        );
+        // Bitmap shouldn't extend past the Letter page when rendered
+        // at the encode DPI — the PDF layer would clip it otherwise.
+        assert!(
+            page.height < (11 * 600 + 600), // ≤ 11" + 1" slack
+            "page {i}: bitmap height {} px > Letter at 600 dpi; PDF would \
+             clip the bottom",
+            page.height,
+        );
+    }
+}
