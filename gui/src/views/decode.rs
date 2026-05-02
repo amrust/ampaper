@@ -44,6 +44,14 @@ pub struct DecodeView {
     reports: Vec<PageReport>,
     /// Recovered plaintext, cleared on each new request.
     last_plaintext: Option<Vec<u8>>,
+    /// True when the most recent run ended with `Failed`. Drives a
+    /// red banner above the page-status grid so the user gets a
+    /// loud "decode failed" signal beyond just dim status text.
+    last_failed: bool,
+    /// Set when a successful decode just landed and we owe the user
+    /// a save-as dialog. Drained on the next frame so we don't pop
+    /// rfd while still inside the worker-message drain loop.
+    wants_auto_save: bool,
 }
 
 impl DecodeView {
@@ -77,13 +85,34 @@ impl DecodeView {
         });
 
         ui.add_space(12.0);
-        if !self.last_status.is_empty() {
+        if self.last_failed {
+            // Loud red error block above the grid so the user
+            // doesn't have to read the dim status line to realise
+            // a decode failed. Sized larger and bolded — the grid
+            // below still tells the why-story (red cells / blanks).
+            ui.label(
+                egui::RichText::new(format!("⚠ {}", self.last_status))
+                    .color(egui::Color32::from_rgb(220, 80, 80))
+                    .strong(),
+            );
+        } else if !self.last_status.is_empty() {
             ui.label(egui::RichText::new(&self.last_status).weak());
         }
 
         if !self.reports.is_empty() {
             ui.add_space(8.0);
             self.show_reports(ui);
+        }
+
+        // PB-1.10-style auto-save: pop the save dialog as soon as
+        // a decode lands. Done outside drain_worker so rfd doesn't
+        // run inside the worker-message loop. If the user cancels,
+        // last_plaintext stays around so the manual "Save as..."
+        // button remains available.
+        if std::mem::take(&mut self.wants_auto_save)
+            && let Some(status) = self.run_save_dialog()
+        {
+            self.last_status = status;
         }
 
         if let Some(save_status) = self.show_save_row(ui) {
@@ -169,6 +198,8 @@ impl DecodeView {
         // Reset display state for the new request.
         self.reports.clear();
         self.last_plaintext = None;
+        self.last_failed = false;
+        self.wants_auto_save = false;
         self.last_status = "Loading...".into();
 
         let mut pages = Vec::with_capacity(self.queued_paths.len());
@@ -208,12 +239,20 @@ impl DecodeView {
                 Ok(DecodeMessage::Done { plaintext }) => {
                     self.last_status = format!("Done. Recovered {} bytes.", plaintext.len());
                     self.last_plaintext = Some(plaintext);
+                    self.last_failed = false;
+                    // Flag for the show() pass to pop the save-as
+                    // dialog. We can't pop it here because rfd's
+                    // modal would nest inside the worker-message
+                    // drain — egui's frame loop doesn't love that.
+                    self.wants_auto_save = true;
                     self.job = None;
                     return;
                 }
                 Ok(DecodeMessage::Failed(e)) => {
-                    self.last_status = format!("Failed: {e}");
+                    self.last_status = format!("Decode failed: {e}");
                     self.last_plaintext = None;
+                    self.last_failed = true;
+                    self.wants_auto_save = false;
                     self.job = None;
                     return;
                 }
@@ -241,18 +280,30 @@ impl DecodeView {
                 plaintext.len(),
                 if plaintext.len() == 1 { "" } else { "s" }
             ));
-            if ui.button("Save as...").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_file_name(self.suggested_save_name())
-                    .save_file()
-            {
-                new_status = Some(match std::fs::write(&path, plaintext) {
-                    Ok(()) => format!("Saved {}", path.display()),
-                    Err(e) => format!("Save failed: {e}"),
-                });
+            if ui.button("Save as...").clicked() {
+                new_status = self.run_save_dialog();
             }
         });
         new_status
+    }
+
+    /// Pop the native save-as dialog with the recovered filename
+    /// pre-filled and write the plaintext to disk. Returns
+    /// `Some(status_string)` summarising the outcome (saved /
+    /// cancelled / failed) so the caller can update `last_status`.
+    /// Returns `None` only when there's nothing recovered to save.
+    fn run_save_dialog(&self) -> Option<String> {
+        let plaintext = self.last_plaintext.as_ref()?;
+        let path = rfd::FileDialog::new()
+            .set_file_name(self.suggested_save_name())
+            .save_file();
+        Some(match path {
+            None => "Save cancelled.".into(),
+            Some(path) => match std::fs::write(&path, plaintext) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("Save failed: {e}"),
+            },
+        })
     }
 
     fn show_reports(&self, ui: &mut egui::Ui) {
