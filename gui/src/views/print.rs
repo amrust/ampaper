@@ -1,10 +1,11 @@
 // Print tab.
 //
-// Drop ANY file (or a pre-rendered ampaper bitmap, or an
-// already-encoded PDF) and ampaper:
-//   - if the input looks like a bitmap or PDF, passes it through;
-//   - otherwise, encodes it on the fly via the Encode tab's settings
-//     (paper size, redundancy, compression, v2 password).
+// Drop ANY file (or a pre-rendered ampaper bitmap) and ampaper:
+//   - if the input looks like an already-rendered bitmap (BMP/PNG/
+//     JPG), passes it through;
+//   - otherwise — including PDFs — encodes its bytes on the fly via
+//     the Encode tab's settings (paper size, redundancy,
+//     compression, v2 password).
 // Then sends the resulting page bitmaps to a printer (Windows GDI)
 // or saves them as a multi-page PDF (cross-platform).
 //
@@ -53,9 +54,10 @@ impl PrintView {
         ui.add_space(6.0);
         ui.label(
             "Drop ANY file into this window — text, image, archive, \
-             whatever — and ampaper encodes it on the fly using your \
-             Encode tab settings, then prints or saves a print-ready \
-             PDF. Pre-encoded bitmaps and PDFs are passed through as-is.",
+             PDF, whatever — and ampaper encodes it on the fly using \
+             your Encode tab settings, then prints or saves a print-\
+             ready PDF. Pre-rendered bitmaps (BMP/PNG/JPG) are passed \
+             through as-is.",
         );
         ui.add_space(12.0);
         ui.separator();
@@ -160,7 +162,7 @@ impl PrintView {
                 ui.label(
                     egui::RichText::new(
                         "Encode tab is set to v2 — raw files need a password. \
-                         (Pre-encoded bitmaps and PDFs pass through unchanged.)",
+                         (Pre-rendered bitmaps pass through unchanged.)",
                     )
                     .small()
                     .weak(),

@@ -335,9 +335,8 @@ fn format_byte_count(n: u64) -> String {
 }
 
 /// PaperBack 1.10's drop-any-file UX: each input is either a
-/// pre-rendered bitmap (BMP/PNG/JPG — pass straight through), a PDF
-/// (already-rendered output OR scanner output — keep as-is for
-/// printing), or anything else (raw file → encode through the
+/// pre-rendered bitmap (BMP/PNG/JPG — pass straight through) or
+/// anything else (raw file, including PDFs → encode through the
 /// codec using the supplied settings).
 ///
 /// Returns the bitmaps in the order the user dropped them; raw
@@ -367,18 +366,6 @@ pub fn prepare_print_pages(
                     width: w,
                     height: h,
                 });
-            }
-            InputKind::Pdf => {
-                // PDF on the Print tab is treated as "this is
-                // already a printable doc" — pass it through to
-                // print_pages or copy verbatim for save-as-pdf.
-                // For now we render it back to bitmaps so the same
-                // PrintPage flow handles all cases. A future
-                // optimisation could short-circuit "PDF in → PDF
-                // out" without re-rendering, but that's pure
-                // efficiency.
-                let pages = render_pdf_via_pdfium(p)?;
-                out.extend(pages);
             }
             InputKind::Raw => {
                 // Encode this file through the codec. We shrink the
@@ -470,11 +457,12 @@ pub fn prepare_print_pages(
     Ok(out)
 }
 
-/// What the first few bytes of a file say about its format.
+/// What the first few bytes of a file say about its format. Only
+/// pre-rendered bitmap formats get pass-through treatment — every
+/// other format (including PDF) is treated as raw bytes to encode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputKind {
     Image,
-    Pdf,
     Raw,
 }
 
@@ -488,10 +476,10 @@ fn sniff_kind(path: &Path) -> Result<InputKind, PrintError> {
             message: e.to_string(),
         })?;
     let head = &sniff[..n];
-    if head.starts_with(b"%PDF-") {
-        return Ok(InputKind::Pdf);
-    }
-    // BMP "BM", PNG \x89PNG, JPEG \xFF\xD8\xFF.
+    // BMP "BM", PNG \x89PNG, JPEG \xFF\xD8\xFF. PDFs deliberately
+    // *not* matched here: most PDFs dropped on the Print tab are
+    // user data the user wants encoded, not ampaper-rendered output
+    // to be re-printed verbatim.
     if head.starts_with(b"BM")
         || head.starts_with(b"\x89PNG")
         || head.starts_with(&[0xFFu8, 0xD8, 0xFF])
@@ -499,96 +487,6 @@ fn sniff_kind(path: &Path) -> Result<InputKind, PrintError> {
         return Ok(InputKind::Image);
     }
     Ok(InputKind::Raw)
-}
-
-/// Render every page of a PDF into [`PrintPage`]s via pdfium. Lives
-/// here (not just in worker.rs) so the Print tab can pass
-/// already-PDF inputs straight through without touching Decode-tab
-/// internals. Mirrors the worker.rs implementation; we tolerate the
-/// duplication because keeping print.rs's API surface
-/// self-contained is worth more than DRY.
-fn render_pdf_via_pdfium(path: &Path) -> Result<Vec<PrintPage>, PrintError> {
-    use pdfium_render::prelude::PdfRenderConfig;
-    const RENDER_DPI: u32 = 1200;
-
-    let pdfium = bind_pdfium_local().map_err(|e| PrintError::Io {
-        path: path.display().to_string(),
-        message: format!(
-            "PDFium library not found ({e}). The expected pdfium.dll / \
-             libpdfium.so / libpdfium.dylib should ship next to the \
-             ampaper-gui binary; if it's missing, restore it from \
-             gui/vendor/pdfium/<target>/ or rebuild from a clean checkout."
-        ),
-    })?;
-    let document = pdfium.load_pdf_from_file(path, None).map_err(|e| PrintError::Io {
-        path: path.display().to_string(),
-        message: format!("PDFium failed to open: {e}"),
-    })?;
-    let mut out = Vec::new();
-    for page in document.pages().iter() {
-        let width_in = page.width().value / 72.0;
-        let height_in = page.height().value / 72.0;
-        let target_w = (width_in * RENDER_DPI as f32).round().max(1.0) as i32;
-        let target_h = (height_in * RENDER_DPI as f32).round().max(1.0) as i32;
-        let config = PdfRenderConfig::new()
-            .set_target_width(target_w)
-            .set_target_height(target_h)
-            .set_image_smoothing(false)
-            .set_path_smoothing(false)
-            .set_text_smoothing(false);
-        let bitmap = page.render_with_config(&config).map_err(|e| PrintError::Io {
-            path: path.display().to_string(),
-            message: format!("PDFium render: {e}"),
-        })?;
-        let dyn_image = bitmap.as_image().map_err(|e| PrintError::Io {
-            path: path.display().to_string(),
-            message: format!("PDFium bitmap → image: {e}"),
-        })?;
-        let luma = dyn_image.to_luma8();
-        let (w, h) = luma.dimensions();
-        out.push(PrintPage {
-            bitmap: luma.into_raw(),
-            width: w,
-            height: h,
-        });
-    }
-    Ok(out)
-}
-
-/// Stateless pdfium binder — handles `PdfiumLibraryBindingsAlreadyInitialized`
-/// as a success case (the global bindings already exist; we hand
-/// back a fresh zero-state `Pdfium {}` that reuses them). Same
-/// shape as `crate::worker::bind_pdfium`. We keep a local copy here
-/// so this file compiles cleanly when `#[path]`-included into a
-/// test or example crate that doesn't have a sibling worker module.
-fn bind_pdfium_local() -> Result<pdfium_render::prelude::Pdfium, pdfium_render::prelude::PdfiumError>
-{
-    use pdfium_render::prelude::{Pdfium, PdfiumError};
-    fn already_init(e: &PdfiumError) -> bool {
-        matches!(e, PdfiumError::PdfiumLibraryBindingsAlreadyInitialized)
-    }
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    if let Some(dir) = exe_dir {
-        let candidate = Pdfium::pdfium_platform_library_name_at_path(&dir);
-        match Pdfium::bind_to_library(&candidate) {
-            Ok(b) => return Ok(Pdfium::new(b)),
-            Err(e) if already_init(&e) => return Ok(Pdfium {}),
-            Err(_) => {}
-        }
-    }
-    let cwd = Pdfium::pdfium_platform_library_name_at_path("./");
-    match Pdfium::bind_to_library(&cwd) {
-        Ok(b) => return Ok(Pdfium::new(b)),
-        Err(e) if already_init(&e) => return Ok(Pdfium {}),
-        Err(_) => {}
-    }
-    match Pdfium::bind_to_system_library() {
-        Ok(b) => Ok(Pdfium::new(b)),
-        Err(e) if already_init(&e) => Ok(Pdfium {}),
-        Err(e) => Err(e),
-    }
 }
 
 #[cfg(windows)]

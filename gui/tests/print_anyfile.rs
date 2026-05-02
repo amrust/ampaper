@@ -183,3 +183,69 @@ fn print_tab_passes_pre_rendered_bitmap_through() {
     assert_eq!(pages[0].height, h);
     assert_eq!(pages[0].bitmap, pixels, "BMP pixel data must round-trip");
 }
+
+#[test]
+fn print_tab_encodes_pdf_input_as_data_not_passthrough() {
+    // Regression: dropping a regular (non-ampaper) PDF on the Print
+    // tab used to pass it through as "already-rendered output",
+    // re-rasterising the human-readable pages instead of encoding
+    // its bytes. Now PDFs go through the same encode-as-data path
+    // as any other binary file. Confirm by:
+    //   - feeding a dummy `%PDF-...` byte string,
+    //   - calling prepare_print_pages,
+    //   - checking the bitmaps it returns aren't the input pixels
+    //     (encoded ampaper bitmaps are 8.5"-wide-at-the-printer-DPI,
+    //     vastly larger than a 612×792-point text PDF would render).
+    let tmp = std::env::temp_dir().join("ampaper-gui-print-anyfile-pdf");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Simplest possible "valid-ish" PDF — magic bytes + minimum
+    // structure. We don't need it to actually render; we just need
+    // sniff_kind to see a PDF and prepare_print_pages to NOT route
+    // it through pdfium-as-pass-through.
+    let pdf_bytes = b"%PDF-1.4\n\
+        1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+        2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+        3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >> endobj\n\
+        xref\n0 4\ntrailer << /Size 4 /Root 1 0 R >>\n%%EOF\n"
+        .to_vec();
+    let pdf_path = tmp.join("dummy.pdf");
+    std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+
+    let opts = EncodeOptions {
+        geometry: scan_geometry(),
+        redundancy: NGROUP_DEFAULT,
+        compress: false,
+        black: BLACK_PAPER,
+        pad_to_full_page: false,
+    };
+    let pages = prepare_print_pages(
+        std::slice::from_ref(&pdf_path),
+        &opts,
+        QualityPreset::Normal,
+        None,
+    )
+    .expect("PDF input should encode through the codec, not fail");
+    assert!(
+        !pages.is_empty(),
+        "PDF input should produce at least one ampaper-encoded bitmap"
+    );
+
+    // The old pass-through path rasterised PDFs at 1200 DPI, so a
+    // 612×792-pt page came out 10200×13200 px. Encoded ampaper
+    // bitmaps for a 215-byte payload at Normal density stay well
+    // under 5000 px in either axis — they're sized by cell count,
+    // not by source page area. A cap at 8000 px catches the
+    // pass-through regression with comfortable headroom.
+    for (i, page) in pages.iter().enumerate() {
+        assert!(
+            page.width < 8000 && page.height < 8000,
+            "page {i}: bitmap {}x{} is too large for an encoded ampaper page \
+             — likely a pdfium-rasterised pass-through (regression of the \
+             tekscan.pdf bug)",
+            page.width,
+            page.height,
+        );
+    }
+}
