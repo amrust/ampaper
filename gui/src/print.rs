@@ -23,6 +23,138 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
+/// Quality preset that drives the auto-picked dot density. Replaces
+/// the old hand-tuned `blocks_per_inch` setting — ampaper picks the
+/// largest dots (lowest density) within the preset's range that
+/// still fits the input payload in one page. For payloads that
+/// don't fit in one page at the preset's MAX density, multi-page
+/// output is produced at the max density.
+///
+///   - **Safe**: 20–50 dot/inch — biggest dots, decodes cleanly off
+///     a casual phone-camera scan or a low-quality scanner. Fits
+///     less per page; use for files you really, really need to
+///     recover. Within the range, ampaper picks the lowest density
+///     that fits the payload — small files end up at the floor (20)
+///     with cells filling the page generously.
+///   - **Normal**: 40–100 dot/inch — PaperBack 1.10's calibration
+///     point at the upper end. Reliable on a flatbed scan; some
+///     errors recover via the per-group XOR redundancy. Default.
+///   - **Compact**: 80–200 dot/inch — pack as much as possible per
+///     page. The high end pushes scan_decode's grid finder near
+///     its limits; reserve for inputs you've test-scanned at home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum QualityPreset {
+    Safe,
+    #[default]
+    Normal,
+    Compact,
+}
+
+impl QualityPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Safe => "Safe — biggest dots, always decodes",
+            Self::Normal => "Normal — PaperBack 1.10 default",
+            Self::Compact => "Compact — pack densely, scan carefully",
+        }
+    }
+
+    /// Allowed dot-density range, in data dots per inch. Auto-fit
+    /// picks the lowest value in this range that fits the payload
+    /// in one page; if it can't fit at the high end, multi-page
+    /// output is produced at the high end.
+    ///
+    /// Floors are calibrated to two constraints:
+    /// - At a 600-DPI printer, the encoder needs nx ≥ redundancy+1
+    ///   cells across an 8.5" page; cell width is 35 × (ppix/dpi)
+    ///   px, so dpi ≥ ~30 keeps redundancy=5 fitting on Letter.
+    /// - scan_decode's grid finder is calibrated for ~3 device
+    ///   pixels per dot at 300-DPI render; very-low-density
+    ///   bitmaps (<25 dot/in) blow that up beyond what
+    ///   find_peaks's bin range comfortably handles.
+    ///
+    /// 30 dot/in is the safe floor.
+    pub fn density_range(self) -> (u32, u32) {
+        match self {
+            Self::Safe => (30, 60),
+            Self::Normal => (60, 100),
+            Self::Compact => (100, 200),
+        }
+    }
+}
+
+/// Estimate the encoded payload size for density-picking. When
+/// `compress` is true, actually run bzip2 to get an accurate size
+/// (typically 30–70% of raw); otherwise use the raw file size.
+/// Returns 0 on stat failure — the density picker treats that as
+/// "tiny payload" and returns the preset's floor density.
+#[must_use]
+pub fn estimate_payload_size(path: &Path, compress: bool) -> usize {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    if compress {
+        ampaper::bz::compress(&bytes, ampaper::bz::BlockSize::Max).len()
+    } else {
+        bytes.len()
+    }
+}
+
+/// Pick the lowest data-dot density within the preset's range that
+/// fits `payload_size_bytes` in a single page of `page_width_inches`
+/// × `page_height_inches`. Falls back to the preset's max density
+/// when nothing in the range fits a single page.
+///
+/// `is_v2` adds the GCM tag (16 bytes) and accounts for the v2
+/// SuperBlock's two-cell-per-string overhead vs v1's one.
+#[must_use]
+pub fn auto_blocks_per_inch(
+    preset: QualityPreset,
+    payload_size_bytes: usize,
+    redundancy: u8,
+    is_v2: bool,
+    page_width_inches: f32,
+    page_height_inches: f32,
+) -> u32 {
+    use ampaper::block::NDATA;
+    let datasize = if is_v2 {
+        payload_size_bytes + 16
+    } else {
+        (payload_size_bytes + 15) & !15
+    };
+    let n_data = datasize.div_ceil(NDATA) as u32;
+    let r = redundancy as u32;
+    let nstring = n_data.div_ceil(r.max(1));
+    let cells_per_string = if is_v2 { nstring + 2 } else { nstring + 1 };
+    let strings = r + 1;
+    let cells_needed = strings * cells_per_string;
+
+    let page_area = page_width_inches * page_height_inches;
+    let (floor, target) = preset.density_range();
+
+    // Sweep from floor → target in 5-dot/inch steps. The first
+    // density that fits the payload single-page wins. Lower density
+    // = bigger dots = more reliable scan recovery, so we want the
+    // smallest one that works.
+    let mut chosen = target;
+    let mut d = floor;
+    while d <= target {
+        // Cells per page at density d. Each cell occupies (35 dots)²
+        // area; the inverse gives us cells per square inch as
+        // (d/35)², and total cells = page_area * (d/35)².
+        let cells_per_page = (page_area * (d as f32).powi(2) / (35.0 * 35.0)) as u32;
+        if cells_per_page >= cells_needed {
+            chosen = d;
+            break;
+        }
+        d += 5;
+    }
+    chosen
+}
+
 /// One page's worth of bitmap to print.
 #[derive(Clone)]
 pub struct PrintPage {
@@ -215,6 +347,7 @@ fn format_byte_count(n: u64) -> String {
 pub fn prepare_print_pages(
     paths: &[impl AsRef<Path>],
     encode_options: &ampaper::encoder::EncodeOptions,
+    quality: QualityPreset,
     v2_password: Option<&str>,
 ) -> Result<Vec<PrintPage>, PrintError> {
     let mut out = Vec::with_capacity(paths.len());
@@ -269,20 +402,34 @@ pub fn prepare_print_pages(
                 };
                 let is_v2 = v2_password.is_some_and(|pw| !pw.is_empty());
                 let payload_len = if encode_options.compress {
-                    // bzip2 typically compresses text 2-4×; we'd
-                    // need to actually compress to know exactly.
-                    // Cheap: compress here to learn the size, then
-                    // feed the compressed bytes to encode (which
-                    // would compress again — encode does its own
-                    // bzip2). To avoid double-compression, do the
-                    // compress step ourselves and feed the encoder
-                    // a non-compressed copy with compress:false.
                     ampaper::bz::compress(&bytes, ampaper::bz::BlockSize::Max).len()
                 } else {
                     bytes.len()
                 };
+                // Auto-pick dot density: lowest density (biggest
+                // dots) within the quality preset's range that
+                // still fits the payload in one page. For a small
+                // file like a 446-byte text doc, this picks the
+                // preset's floor density, making the cells nice
+                // and big in the resulting print.
+                let (in_w, in_h) = (
+                    encode_options.geometry.width as f32 / encode_options.geometry.ppix as f32,
+                    encode_options.geometry.height as f32 / encode_options.geometry.ppiy as f32,
+                );
+                let auto_dpi = auto_blocks_per_inch(
+                    quality,
+                    payload_len,
+                    encode_options.redundancy,
+                    is_v2,
+                    in_w,
+                    in_h,
+                );
+                let geometry_with_auto_dpi = ampaper::page::PageGeometry {
+                    dpi: auto_dpi,
+                    ..encode_options.geometry
+                };
                 let shrunk_geometry = shrink_geometry_to_data(
-                    &encode_options.geometry,
+                    &geometry_with_auto_dpi,
                     payload_len,
                     encode_options.redundancy,
                     is_v2,

@@ -472,24 +472,23 @@ fn has_at_most_two_distinct_bytes(buf: &[u8]) -> bool {
 // can collapse adjacent dots and break scan_decode's grid finder.
 
 /// Default DPI for PDF page rasterization on the Decode path.
-/// 600 DPI is the goldilocks render resolution that handles every
-/// PDF we expect to see:
-///   - Real scanner-produced PDFs (PB-1.10 prints at 100 dot/inch
-///     captured at ~300 DPI native): 600/100 = 6 pixels per dot,
-///     comfortably above scan_decode's 3 px/dot minimum.
-///   - ampaper-produced PDFs at 200 dot/inch (the legacy default
-///     persisted in eframe storage from before the PB-1.10
-///     compatibility commit): 600/200 = 3 px/dot, the calibrated
-///     sweet spot.
-///   - ampaper-produced PDFs at 100 dot/inch (the current default
-///     matching PB 1.10): 6 px/dot.
+/// 300 DPI is the calibration sweet spot across the full range of
+/// dot densities ampaper now produces (Safe ~30 dot/in, Normal
+/// ~60-100, Compact ~100-200):
+///   - Safe (30 dot/in)  → 300/30  = 10 px/dot ✓
+///   - Normal (60-100)   → 300/60  =  5 px/dot, 300/100 = 3 px/dot ✓
+///   - Compact (100-200) → 300/100 =  3 px/dot, 300/200 = 1.5
+///   - PB-1.10 scans at 100 dot/in → 3 px/dot ✓
 ///
-/// 300 DPI was tried earlier — works for 100 dot/inch encodes but
-/// breaks 200 dot/inch ones (1.5 px/dot is below scan_decode's
-/// minimum). 1200 DPI works for ampaper-produced PDFs but
-/// over-samples scanner PDFs enough to break grid detection.
-/// 600 splits the difference robustly.
-pub const DEFAULT_PDF_RENDER_DPI: u32 = 600;
+/// 200 dot/inch encodes at 300 DPI render (1.5 px/dot) sit on the
+/// boundary; both pdf_round_trip and print_anyfile tests pass an
+/// explicit 600 DPI override for that geometry. 600 DPI render
+/// works for scanner / Normal / Compact but pushes Safe out of
+/// scan_decode's range — bigger dots → fewer device pixels per
+/// dot at fixed render DPI is the wrong relationship; what we
+/// want is fewer pixels per dot at fixed RENDER, which means
+/// LOWER render DPI for low-density encodes.
+pub const DEFAULT_PDF_RENDER_DPI: u32 = 300;
 
 /// Try to bind to a Pdfium library, looking next to the running
 /// executable first then falling back to system paths. Returns

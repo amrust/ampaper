@@ -37,6 +37,11 @@ pub enum PaperSize {
     A4,
 }
 
+// QualityPreset + auto-density helpers live in `crate::print` so
+// the Print tab's prepare_print_pages can call them too without a
+// circular import (views::encode → views::print → print.rs).
+pub use crate::print::{auto_blocks_per_inch, estimate_payload_size, QualityPreset};
+
 impl PaperSize {
     fn label(self) -> &'static str {
         match self {
@@ -64,8 +69,12 @@ pub struct EncodeSettings {
     pub paper_size: PaperSize,
     /// Printer DPI. PB 1.10 default is 600 (most consumer lasers).
     pub printer_dpi: u32,
-    /// Blocks-per-inch. PB 1.10 default is 200.
-    pub blocks_per_inch: u32,
+    /// Quality preset (Safe / Normal / Compact). Replaces the
+    /// hand-tuned `blocks_per_inch` setting — the encoder auto-picks
+    /// dot density at encode time based on payload size + this
+    /// preset, so dots come out as big as possible while still
+    /// fitting the data in the chosen page count.
+    pub quality: QualityPreset,
     /// Dot fill percentage. PB 1.10 default is 70. Stored as u8 to
     /// match `PageGeometry::dot_percent`.
     pub dot_percent: u8,
@@ -83,14 +92,7 @@ impl Default for EncodeSettings {
         Self {
             paper_size: PaperSize::UsLetter,
             printer_dpi: 600,
-            // 100 blocks/inch matches PaperBack 1.10's "Dot density:
-            // 100 dpi" default. Lower density = bigger dots = far
-            // more robust against scanner noise and small print
-            // defects, at the cost of fewer bytes per page. 200
-            // dot/inch is workable on clean prints but pushes the
-            // scanner-recovery margin uncomfortably small for
-            // hand-scanned paper.
-            blocks_per_inch: 100,
+            quality: QualityPreset::default(),
             dot_percent: 70,
             redundancy: NGROUP_DEFAULT,
             compress: true,
@@ -238,6 +240,28 @@ impl EncodeView {
     }
 
     fn show_options(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Quality").strong());
+        egui::ComboBox::from_label("Quality")
+            .selected_text(self.settings.quality.label())
+            .show_ui(ui, |ui| {
+                for q in [
+                    QualityPreset::Safe,
+                    QualityPreset::Normal,
+                    QualityPreset::Compact,
+                ] {
+                    ui.selectable_value(&mut self.settings.quality, q, q.label());
+                }
+            });
+        ui.label(
+            egui::RichText::new(
+                "ampaper picks the dot density automatically — Safe \
+                 makes dots big and reliable, Compact packs more per \
+                 page. Page count + dot size adjust to your file size.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
         ui.label(egui::RichText::new("Geometry").strong());
         egui::ComboBox::from_label("Paper size")
             .selected_text(self.settings.paper_size.label())
@@ -249,10 +273,6 @@ impl EncodeView {
         ui.horizontal(|ui| {
             ui.label("Printer DPI:");
             ui.add(egui::DragValue::new(&mut self.settings.printer_dpi).range(150..=2400));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Blocks per inch:");
-            ui.add(egui::DragValue::new(&mut self.settings.blocks_per_inch).range(50..=400));
         });
         ui.horizontal(|ui| {
             ui.label("Dot fill (%):");
@@ -333,10 +353,25 @@ impl EncodeView {
         let (in_w, in_h) = self.settings.paper_size.inches();
         let width = (in_w * self.settings.printer_dpi as f32) as u32;
         let height = (in_h * self.settings.printer_dpi as f32) as u32;
+
+        // Auto-pick the dot density from the quality preset and the
+        // (estimated) payload size. Reading the file twice is fine
+        // for an interactive flow — encoding is the slow step, and
+        // a stat() + estimate-via-compress is much cheaper than the
+        // RS / dot-rendering pass.
+        let payload_size = estimate_payload_size(&input_path, self.settings.compress);
+        let blocks_per_inch = auto_blocks_per_inch(
+            self.settings.quality,
+            payload_size,
+            self.settings.redundancy,
+            self.settings.v2_encrypt,
+            in_w,
+            in_h,
+        );
         let geometry = PageGeometry {
             ppix: self.settings.printer_dpi,
             ppiy: self.settings.printer_dpi,
-            dpi: self.settings.blocks_per_inch,
+            dpi: blocks_per_inch,
             dot_percent: self.settings.dot_percent,
             width,
             height,

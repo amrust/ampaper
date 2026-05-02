@@ -15,7 +15,7 @@ mod print;
 use ampaper::block::NGROUP_DEFAULT;
 use ampaper::page::{BLACK_PAPER, PageGeometry};
 
-use print::{prepare_print_pages, save_pages_as_pdf, PdfHeader};
+use print::{prepare_print_pages, save_pages_as_pdf, PdfHeader, QualityPreset};
 
 fn main() -> Result<(), String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -40,32 +40,37 @@ fn main() -> Result<(), String> {
         pad_to_full_page: false,
     };
 
-    let pages = prepare_print_pages(&[&lorem_path], &opts, None)
-        .map_err(|e| format!("prepare: {e}"))?;
-    println!(
-        "page count: {}, first page = {}x{} px",
-        pages.len(),
-        pages[0].width,
-        pages[0].height
-    );
-
     let lorem_meta = std::fs::metadata(&lorem_path).map_err(|e| format!("stat: {e}"))?;
     let modified_unix_secs = lorem_meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
-    let header = PdfHeader {
-        filename: "lorem.input".into(),
-        modified_unix_secs,
-        origsize: lorem_meta.len(),
-    };
 
-    let out = std::env::temp_dir().join("ampaper-lorem.pdf");
-    save_pages_as_pdf(&pages, 600, Some(&header), "lorem", &out)
-        .map_err(|e| format!("save_pages_as_pdf: {e}"))?;
-
-    let size = std::fs::metadata(&out).map_err(|e| format!("{e}"))?.len();
-    println!("wrote {} ({} bytes)", out.display(), size);
+    for (label, q) in [
+        ("safe", QualityPreset::Safe),
+        ("normal", QualityPreset::Normal),
+        ("compact", QualityPreset::Compact),
+    ] {
+        let pages = prepare_print_pages(&[&lorem_path], &opts, q, None)
+            .map_err(|e| format!("prepare {label}: {e}"))?;
+        let header = PdfHeader {
+            filename: "lorem.input".into(),
+            modified_unix_secs,
+            origsize: lorem_meta.len(),
+        };
+        let out = std::env::temp_dir().join(format!("ampaper-lorem-{label}.pdf"));
+        save_pages_as_pdf(&pages, 600, Some(&header), "lorem", &out)
+            .map_err(|e| format!("save {label}: {e}"))?;
+        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "{label:>8}: page count={}, first={}x{} px, pdf={} bytes ({})",
+            pages.len(),
+            pages[0].width,
+            pages[0].height,
+            size,
+            out.display()
+        );
+    }
     Ok(())
 }

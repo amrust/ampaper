@@ -292,7 +292,12 @@ impl PrintView {
                 "v2 encryption is enabled in Settings but no password was supplied.".into();
             return None;
         }
-        match prepare_print_pages(&self.queued_paths, &opts, v2) {
+        match prepare_print_pages(
+            &self.queued_paths,
+            &opts,
+            encode_settings.quality,
+            v2,
+        ) {
             Ok(pages) => Some(pages),
             Err(e) => {
                 self.last_status = format!("{e}");
@@ -322,11 +327,16 @@ fn encode_options_from_settings(
     let (in_w, in_h) = settings.paper_size.inches();
     let width = (in_w * settings.printer_dpi as f32) as u32;
     let height = (in_h * settings.printer_dpi as f32) as u32;
+    // Density at this point is a placeholder — the quality preset's
+    // *target* density. prepare_print_pages re-picks per-input by
+    // running auto_blocks_per_inch on the actual payload size, so
+    // the final encoded bitmap uses dots as big as the data allows.
+    let (_, placeholder_density) = settings.quality.density_range();
     ampaper::encoder::EncodeOptions {
         geometry: PageGeometry {
             ppix: settings.printer_dpi,
             ppiy: settings.printer_dpi,
-            dpi: settings.blocks_per_inch,
+            dpi: placeholder_density,
             dot_percent: settings.dot_percent,
             width,
             height,

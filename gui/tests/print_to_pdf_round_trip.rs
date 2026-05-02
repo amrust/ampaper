@@ -34,7 +34,15 @@ mod print;
 mod worker;
 
 use print::{save_pages_as_pdf, PrintPage};
-use worker::{render_pdf_pages, DEFAULT_PDF_RENDER_DPI};
+use worker::render_pdf_pages;
+
+/// Test fixture encodes at 200 dot/inch (the legacy default before
+/// the QualityPreset auto-density work). The runtime
+/// `DEFAULT_PDF_RENDER_DPI` (300) gives 1.5 px/dot at 200 dot/in
+/// which is below scan_decode's calibrated 3 px/dot floor; pass an
+/// explicit 600 DPI render so the existing 200-dot/in fixture
+/// continues to validate the round-trip.
+const TEST_RENDER_DPI: u32 = 600;
 
 fn lorem_input() -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -89,7 +97,7 @@ fn round_trip(blocks_per_inch: u32) {
     save_pages_as_pdf(&print_pages, 600, None, "lorem", &pdf_path)
         .expect("save_pages_as_pdf should succeed");
 
-    let rendered = match render_pdf_pages(&pdf_path, DEFAULT_PDF_RENDER_DPI) {
+    let rendered = match render_pdf_pages(&pdf_path, TEST_RENDER_DPI) {
         Ok(p) => p,
         Err(e) if e.contains("PDFium library not found") => {
             eprintln!("skipping — pdfium not installed");

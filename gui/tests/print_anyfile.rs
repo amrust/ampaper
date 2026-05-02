@@ -25,7 +25,7 @@ mod print;
 #[path = "../src/worker.rs"]
 mod worker;
 
-use print::{prepare_print_pages, save_pages_as_pdf};
+use print::{prepare_print_pages, save_pages_as_pdf, QualityPreset};
 use worker::{
     DecodeJob, DecodeMessage, DecodePage, DecodeRequest, render_pdf_pages,
 };
@@ -95,8 +95,13 @@ fn print_tab_encodes_raw_file_on_the_fly_and_round_trips_via_pdf() {
 
     // 3. prepare_print_pages should sniff "notes.txt", see it's not
     //    a bitmap or PDF, and encode it on the fly.
-    let pages = prepare_print_pages(std::slice::from_ref(&raw_path), &opts, None)
-        .expect("prepare_print_pages should encode raw input");
+    let pages = prepare_print_pages(
+        std::slice::from_ref(&raw_path),
+        &opts,
+        QualityPreset::Normal,
+        None,
+    )
+    .expect("prepare_print_pages should encode raw input");
     assert!(
         !pages.is_empty(),
         "raw file should produce at least one bitmap page"
@@ -171,7 +176,7 @@ fn print_tab_passes_pre_rendered_bitmap_through() {
         black: BLACK_PAPER,
         pad_to_full_page: false,
     };
-    let pages = prepare_print_pages(&[bmp_path], &opts, None)
+    let pages = prepare_print_pages(&[bmp_path], &opts, QualityPreset::Normal, None)
         .expect("BMP input should pass through");
     assert_eq!(pages.len(), 1, "single BMP → single PrintPage");
     assert_eq!(pages[0].width, w);
