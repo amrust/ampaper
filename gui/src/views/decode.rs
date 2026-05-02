@@ -354,13 +354,13 @@ impl DecodeView {
 fn status_color(s: CellStatus) -> egui::Color32 {
     // Colors chosen to be distinguishable in dark mode AND match
     // PB 1.10's posture: green = good, red = bad, blue = control,
-    // dim grey = nothing-to-decode-here.
+    // light grey = nothing-to-decode-here (paper).
     match s {
         CellStatus::DataOk => egui::Color32::from_rgb(72, 168, 96), // green
         CellStatus::Super => egui::Color32::from_rgb(80, 132, 200), // blue
         CellStatus::Recovery => egui::Color32::from_rgb(160, 110, 200), // purple-ish blue
         CellStatus::Damaged => egui::Color32::from_rgb(200, 70, 70), // red
-        CellStatus::Empty => egui::Color32::from_rgb(70, 70, 70),   // dim grey
+        CellStatus::Empty => egui::Color32::from_rgb(190, 190, 190), // light grey
     }
 }
 
