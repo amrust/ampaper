@@ -429,41 +429,63 @@ fn classify_cell(cell: &[u8; ampaper::block::BLOCK_BYTES]) -> CellStatus {
 // resolved. Rendering at lower DPI (e.g., 200, the scanner's native)
 // can collapse adjacent dots and break scan_decode's grid finder.
 
-/// Default DPI for PDF page rasterization on the Decode path. We
-/// render at 1200 DPI (typically 2× the encode DPI) so any sub-
-/// pixel drift introduced by the inches → mm → inches roundtrip
-/// inside the PDF page-size encoding doesn't push ampaper dots
-/// across pixel boundaries. scan_decode's grid detector handles
-/// integer-pixel shifts cleanly when each dot is at least ~6
-/// pixels wide. For scanner-output PDFs (typically 200–300 DPI
-/// native), 1200 also oversamples enough that the dot pattern
-/// the scanner captured stays readable.
-pub const DEFAULT_PDF_RENDER_DPI: u32 = 1200;
+/// Default DPI for PDF page rasterization on the Decode path.
+/// 300 DPI is the sweet spot for typical scanner-produced PDFs:
+///   - PB 1.10 default dot density is 100 dot/inch; a 300-DPI
+///     render gives 3 device pixels per dot, exactly what
+///     scan_decode's grid finder is calibrated for.
+///   - Real scanner output is usually 200–300 DPI native; rendering
+///     at the same DPI matches the captured pixels without
+///     up-sampling artefacts.
+///   - For ampaper-produced PDFs encoded at 100 dot/inch (the new
+///     default matching PB 1.10), this also gives 3 pixels per dot
+///     after the inches → mm → inches PDF page-size roundtrip.
+///
+/// PDFs whose encode used a denser dot grid (200 dot/inch from
+/// older ampaper builds, for example) would want a higher render
+/// DPI; tests that exercise that path pass an explicit DPI rather
+/// than relying on the default.
+pub const DEFAULT_PDF_RENDER_DPI: u32 = 300;
 
 /// Try to bind to a Pdfium library, looking next to the running
 /// executable first then falling back to system paths. Returns
 /// `Result` instead of panicking the way `Pdfium::default()` does
 /// — the worker surfaces this as an error message in the status bar
 /// rather than crashing the GUI.
-fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
-    // Look for pdfium next to the current exe (the typical
-    // distribution path) before falling back to system paths.
+///
+/// pdfium-render's bindings are process-global. After a successful
+/// first call, subsequent `bind_to_library` calls return
+/// `PdfiumLibraryBindingsAlreadyInitialized`; we treat that as
+/// success and produce a fresh `Pdfium {}` zero-state handle that
+/// reuses the existing global bindings. This keeps the function
+/// stateless — no OnceLock or mutex needed — and lets a sibling
+/// module (`crate::print`) keep its own copy without coordination.
+pub(crate) fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
+    fn already_init(e: &PdfiumError) -> bool {
+        matches!(e, PdfiumError::PdfiumLibraryBindingsAlreadyInitialized)
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     if let Some(dir) = exe_dir {
         let candidate = Pdfium::pdfium_platform_library_name_at_path(&dir);
-        if let Ok(b) = Pdfium::bind_to_library(&candidate) {
-            return Ok(Pdfium::new(b));
+        match Pdfium::bind_to_library(&candidate) {
+            Ok(b) => return Ok(Pdfium::new(b)),
+            Err(e) if already_init(&e) => return Ok(Pdfium {}),
+            Err(_) => {}
         }
     }
-    // Fallback: cwd, then system.
     let cwd_candidate = Pdfium::pdfium_platform_library_name_at_path("./");
-    if let Ok(b) = Pdfium::bind_to_library(&cwd_candidate) {
-        return Ok(Pdfium::new(b));
+    match Pdfium::bind_to_library(&cwd_candidate) {
+        Ok(b) => return Ok(Pdfium::new(b)),
+        Err(e) if already_init(&e) => return Ok(Pdfium {}),
+        Err(_) => {}
     }
-    let system = Pdfium::bind_to_system_library()?;
-    Ok(Pdfium::new(system))
+    match Pdfium::bind_to_system_library() {
+        Ok(b) => Ok(Pdfium::new(b)),
+        Err(e) if already_init(&e) => Ok(Pdfium {}),
+        Err(e) => Err(e),
+    }
 }
 
 /// True when `bytes` start with the `%PDF-` magic that every PDF

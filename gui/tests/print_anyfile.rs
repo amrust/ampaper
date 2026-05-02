@@ -27,9 +27,14 @@ mod worker;
 
 use print::{prepare_print_pages, save_pages_as_pdf};
 use worker::{
-    DecodeJob, DecodeMessage, DecodePage, DecodeRequest, DEFAULT_PDF_RENDER_DPI,
-    render_pdf_pages,
+    DecodeJob, DecodeMessage, DecodePage, DecodeRequest, render_pdf_pages,
 };
+
+/// Encode geometry below uses 200 dot/inch; render at 600 DPI to
+/// hit scan_decode's preferred 3-device-pixels-per-dot. The runtime
+/// default (`worker::TEST_RENDER_DPI`) is 300, calibrated
+/// for the user-facing 100 dot/inch encode default.
+const TEST_RENDER_DPI: u32 = 600;
 
 fn scan_geometry() -> PageGeometry {
     PageGeometry {
@@ -103,7 +108,7 @@ fn print_tab_encodes_raw_file_on_the_fly_and_round_trips_via_pdf() {
         .expect("PDF save should succeed");
 
     // 5. Render the PDF back via pdfium. Skip if pdfium not present.
-    let rendered = match render_pdf_pages(&pdf_path, DEFAULT_PDF_RENDER_DPI) {
+    let rendered = match render_pdf_pages(&pdf_path, TEST_RENDER_DPI) {
         Ok(p) => p,
         Err(e) if e.contains("PDFium library not found") => {
             eprintln!(

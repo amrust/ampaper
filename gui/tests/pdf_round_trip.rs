@@ -26,7 +26,15 @@ mod print;
 mod worker;
 
 use print::{PrintPage, save_pages_as_pdf};
-use worker::{DEFAULT_PDF_RENDER_DPI, render_pdf_pages};
+use worker::render_pdf_pages;
+
+/// scan_geometry() below encodes at 200 dot/inch (the dense end of
+/// PB 1.10's range). At a 600-DPI render we get 3 device pixels per
+/// dot — exactly what scan_decode's grid finder is calibrated for.
+/// `worker::TEST_RENDER_DPI` is 300, calibrated for the new
+/// 100 dot/inch encode default; these tests override explicitly to
+/// keep the existing geometry working.
+const TEST_RENDER_DPI: u32 = 600;
 
 fn scan_geometry() -> PageGeometry {
     // Same wider geometry the lib's scan tests use — detect_geometry
@@ -83,7 +91,7 @@ fn encode_save_pdf_render_decode_round_trips_bytes() {
     // 3. Render back via pdfium. Skip the test if pdfium isn't
     // available on this machine (no pdfium.dll alongside the test
     // binary AND no system install).
-    let rendered = match render_pdf_pages(&pdf_path, DEFAULT_PDF_RENDER_DPI) {
+    let rendered = match render_pdf_pages(&pdf_path, TEST_RENDER_DPI) {
         Ok(p) => p,
         Err(e) if e.contains("PDFium library not found") => {
             eprintln!(

@@ -83,7 +83,14 @@ impl Default for EncodeSettings {
         Self {
             paper_size: PaperSize::UsLetter,
             printer_dpi: 600,
-            blocks_per_inch: 200,
+            // 100 blocks/inch matches PaperBack 1.10's "Dot density:
+            // 100 dpi" default. Lower density = bigger dots = far
+            // more robust against scanner noise and small print
+            // defects, at the cost of fewer bytes per page. 200
+            // dot/inch is workable on clean prints but pushes the
+            // scanner-recovery margin uncomfortably small for
+            // hand-scanned paper.
+            blocks_per_inch: 100,
             dot_percent: 70,
             redundancy: NGROUP_DEFAULT,
             compress: true,

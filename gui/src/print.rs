@@ -198,7 +198,7 @@ fn render_pdf_via_pdfium(path: &Path) -> Result<Vec<PrintPage>, PrintError> {
     use pdfium_render::prelude::PdfRenderConfig;
     const RENDER_DPI: u32 = 1200;
 
-    let pdfium = bind_pdfium().map_err(|e| PrintError::Io {
+    let pdfium = bind_pdfium_local().map_err(|e| PrintError::Io {
         path: path.display().to_string(),
         message: format!(
             "PDFium library not found ({e}). Place pdfium.dll / \
@@ -242,23 +242,40 @@ fn render_pdf_via_pdfium(path: &Path) -> Result<Vec<PrintPage>, PrintError> {
     Ok(out)
 }
 
-fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, pdfium_render::prelude::PdfiumError> {
-    use pdfium_render::prelude::Pdfium;
+/// Stateless pdfium binder — handles `PdfiumLibraryBindingsAlreadyInitialized`
+/// as a success case (the global bindings already exist; we hand
+/// back a fresh zero-state `Pdfium {}` that reuses them). Same
+/// shape as `crate::worker::bind_pdfium`. We keep a local copy here
+/// so this file compiles cleanly when `#[path]`-included into a
+/// test or example crate that doesn't have a sibling worker module.
+fn bind_pdfium_local() -> Result<pdfium_render::prelude::Pdfium, pdfium_render::prelude::PdfiumError>
+{
+    use pdfium_render::prelude::{Pdfium, PdfiumError};
+    fn already_init(e: &PdfiumError) -> bool {
+        matches!(e, PdfiumError::PdfiumLibraryBindingsAlreadyInitialized)
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    if let Some(dir) = exe_dir
-        && let Ok(b) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
-    {
-        return Ok(Pdfium::new(b));
+    if let Some(dir) = exe_dir {
+        let candidate = Pdfium::pdfium_platform_library_name_at_path(&dir);
+        match Pdfium::bind_to_library(&candidate) {
+            Ok(b) => return Ok(Pdfium::new(b)),
+            Err(e) if already_init(&e) => return Ok(Pdfium {}),
+            Err(_) => {}
+        }
     }
-    if let Ok(b) =
-        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-    {
-        return Ok(Pdfium::new(b));
+    let cwd = Pdfium::pdfium_platform_library_name_at_path("./");
+    match Pdfium::bind_to_library(&cwd) {
+        Ok(b) => return Ok(Pdfium::new(b)),
+        Err(e) if already_init(&e) => return Ok(Pdfium {}),
+        Err(_) => {}
     }
-    let system = Pdfium::bind_to_system_library()?;
-    Ok(Pdfium::new(system))
+    match Pdfium::bind_to_system_library() {
+        Ok(b) => Ok(Pdfium::new(b)),
+        Err(e) if already_init(&e) => Ok(Pdfium {}),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(windows)]
