@@ -204,6 +204,12 @@ pub enum CellStatus {
     /// pull the underlying data block back if no more than one data
     /// cell of the group is in this state.
     Damaged,
+    /// Cell falls outside the data area: blank paper, page header,
+    /// or margin region picked up by the auto-detected grid bounds.
+    /// Distinct from `Damaged` — empty cells are expected on real
+    /// scans with PB-1.10-style headers / borders, not a sign of
+    /// scan corruption. Renders neutrally in the UI.
+    Empty,
 }
 
 /// Per-page classification — mirrors the auto-detected scan grid so
@@ -385,6 +391,20 @@ fn nul_terminated_utf8(bytes: &[u8]) -> Option<String> {
 fn classify_cell(cell: &[u8; ampaper::block::BLOCK_BYTES]) -> CellStatus {
     let block = Block::from_bytes(cell);
     if !block.verify_crc() {
+        // Before calling this Damaged, check if the underlying dot
+        // pattern was actually empty paper — i.e., the cell sampled
+        // to a uniform "no dots" / "all dots" pattern. After
+        // scan_extract's per-row XOR descramble, a flat-white area
+        // produces only the alternating-row scramble bytes
+        // ({0x55, 0xAA}); a flat-black area produces the inverse.
+        // Either way, ≤2 distinct byte values is a strong signal
+        // the cell isn't real data — it's a margin, header strip,
+        // or the blank space outside a small encode's data block
+        // area. Mark Empty so the UI doesn't paint it red and make
+        // the user think their scan is corrupted.
+        if has_at_most_two_distinct_bytes(cell) {
+            return CellStatus::Empty;
+        }
         return CellStatus::Damaged;
     }
     // CRC verified — discriminate by addr.
@@ -409,6 +429,28 @@ fn classify_cell(cell: &[u8; ampaper::block::BLOCK_BYTES]) -> CellStatus {
             }
         }
     }
+}
+
+/// True when the byte buffer contains at most two distinct values.
+/// Used to discriminate "blank paper / margin" cells (which sample
+/// to the alternating-row scramble pattern, i.e. {0x55, 0xAA}) from
+/// "real data block whose CRC failed." A genuine 90-byte data block
+/// with random or near-random content effectively never has only
+/// two distinct values — the false-positive rate is on the order
+/// of 2^-128 — so this is a safe heuristic.
+fn has_at_most_two_distinct_bytes(buf: &[u8]) -> bool {
+    let mut seen = [false; 256];
+    let mut distinct = 0usize;
+    for &b in buf {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            distinct += 1;
+            if distinct > 2 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // ====================================================================

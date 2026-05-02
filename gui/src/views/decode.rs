@@ -264,6 +264,7 @@ impl DecodeView {
             legend_swatch(ui, status_color(CellStatus::Super), "SuperBlock");
             legend_swatch(ui, status_color(CellStatus::Recovery), "Recovery");
             legend_swatch(ui, status_color(CellStatus::Damaged), "Damaged");
+            legend_swatch(ui, status_color(CellStatus::Empty), "Blank");
         });
         ui.add_space(6.0);
 
@@ -304,12 +305,14 @@ impl DecodeView {
 
 fn status_color(s: CellStatus) -> egui::Color32 {
     // Colors chosen to be distinguishable in dark mode AND match
-    // PB 1.10's posture: green = good, red = bad, blue = control.
+    // PB 1.10's posture: green = good, red = bad, blue = control,
+    // dim grey = nothing-to-decode-here.
     match s {
         CellStatus::DataOk => egui::Color32::from_rgb(72, 168, 96), // green
         CellStatus::Super => egui::Color32::from_rgb(80, 132, 200), // blue
         CellStatus::Recovery => egui::Color32::from_rgb(160, 110, 200), // purple-ish blue
         CellStatus::Damaged => egui::Color32::from_rgb(200, 70, 70), // red
+        CellStatus::Empty => egui::Color32::from_rgb(70, 70, 70),   // dim grey
     }
 }
 

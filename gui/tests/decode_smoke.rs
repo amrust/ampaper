@@ -83,15 +83,24 @@ fn run(req: DecodeRequest) -> Result<(Vec<u8>, Vec<PageReport>), String> {
 }
 
 fn percent_damaged(report: &PageReport) -> f32 {
-    if report.cells.is_empty() {
-        return 100.0;
-    }
-    let damaged = report
+    // Damage rate computed against non-Empty cells only. Empty
+    // means "blank paper / margin / outside the data area," which
+    // is expected on real scans (and on compact-rendered pages
+    // with `pad_to_full_page = false`); counting it as failure
+    // would conflate "scan quality" with "page layout."
+    let scoring: Vec<&CellStatus> = report
         .cells
         .iter()
-        .filter(|s| **s == CellStatus::Damaged)
+        .filter(|s| **s != CellStatus::Empty)
+        .collect();
+    if scoring.is_empty() {
+        return 0.0;
+    }
+    let damaged = scoring
+        .iter()
+        .filter(|s| ***s == CellStatus::Damaged)
         .count();
-    100.0 * damaged as f32 / report.cells.len() as f32
+    100.0 * damaged as f32 / scoring.len() as f32
 }
 
 #[test]
