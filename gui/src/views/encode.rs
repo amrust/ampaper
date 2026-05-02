@@ -340,7 +340,13 @@ impl EncodeView {
             dot_percent: self.settings.dot_percent,
             width,
             height,
-            print_border: false,
+            // Match PB-1.10's always-on sync raster (Printer.cpp:858-864).
+            // The border is what scan_decode's grid finder uses to
+            // lock onto the dot pattern after any roundtrip; without
+            // it, BMPs decode fine via decoder::decode (known
+            // geometry) but break on the auto-detect scan path used
+            // by drag-and-drop on the Decode tab.
+            print_border: true,
         };
         let options = EncodeOptions {
             geometry,

@@ -301,7 +301,15 @@ fn encode_options_from_settings(
             dot_percent: settings.dot_percent,
             width,
             height,
-            print_border: false,
+            // PB-1.10 always prints the sync raster around the data
+            // area (Printer.cpp:858-864), and scan_decode's grid
+            // finder relies on it to lock onto the dot pattern after
+            // any roundtrip introduces sub-pixel drift (PDF page-
+            // size rounding, scanner jitter, etc.). Without the
+            // border, ampaper-produced PDFs at typical densities
+            // (200 dot/in) fail "no SuperBlock decoded" on real
+            // scans even when the dots themselves are clean.
+            print_border: true,
         },
         redundancy: settings.redundancy,
         compress: settings.compress,

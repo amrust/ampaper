@@ -472,22 +472,24 @@ fn has_at_most_two_distinct_bytes(buf: &[u8]) -> bool {
 // can collapse adjacent dots and break scan_decode's grid finder.
 
 /// Default DPI for PDF page rasterization on the Decode path.
-/// 300 DPI is the sweet spot for typical scanner-produced PDFs:
-///   - PB 1.10 default dot density is 100 dot/inch; a 300-DPI
-///     render gives 3 device pixels per dot, exactly what
-///     scan_decode's grid finder is calibrated for.
-///   - Real scanner output is usually 200–300 DPI native; rendering
-///     at the same DPI matches the captured pixels without
-///     up-sampling artefacts.
-///   - For ampaper-produced PDFs encoded at 100 dot/inch (the new
-///     default matching PB 1.10), this also gives 3 pixels per dot
-///     after the inches → mm → inches PDF page-size roundtrip.
+/// 600 DPI is the goldilocks render resolution that handles every
+/// PDF we expect to see:
+///   - Real scanner-produced PDFs (PB-1.10 prints at 100 dot/inch
+///     captured at ~300 DPI native): 600/100 = 6 pixels per dot,
+///     comfortably above scan_decode's 3 px/dot minimum.
+///   - ampaper-produced PDFs at 200 dot/inch (the legacy default
+///     persisted in eframe storage from before the PB-1.10
+///     compatibility commit): 600/200 = 3 px/dot, the calibrated
+///     sweet spot.
+///   - ampaper-produced PDFs at 100 dot/inch (the current default
+///     matching PB 1.10): 6 px/dot.
 ///
-/// PDFs whose encode used a denser dot grid (200 dot/inch from
-/// older ampaper builds, for example) would want a higher render
-/// DPI; tests that exercise that path pass an explicit DPI rather
-/// than relying on the default.
-pub const DEFAULT_PDF_RENDER_DPI: u32 = 300;
+/// 300 DPI was tried earlier — works for 100 dot/inch encodes but
+/// breaks 200 dot/inch ones (1.5 px/dot is below scan_decode's
+/// minimum). 1200 DPI works for ampaper-produced PDFs but
+/// over-samples scanner PDFs enough to break grid detection.
+/// 600 splits the difference robustly.
+pub const DEFAULT_PDF_RENDER_DPI: u32 = 600;
 
 /// Try to bind to a Pdfium library, looking next to the running
 /// executable first then falling back to system paths. Returns

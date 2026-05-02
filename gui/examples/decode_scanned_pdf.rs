@@ -18,12 +18,20 @@ use worker::render_pdf_pages;
 
 fn main() -> Result<(), String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let pdf_path = std::path::PathBuf::from(manifest_dir)
-        .join("../tests/golden/v1-paperbak/img20260501_21181215.pdf");
+    // First arg overrides the default scanned PDF — use it to point
+    // at lorem2.pdf or any other test artifact.
+    let pdf_path = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(manifest_dir)
+                .join("../tests/golden/v1-paperbak/img20260501_21181215.pdf")
+        });
     let lorem_path = std::path::PathBuf::from(manifest_dir)
         .join("../tests/golden/v1-paperbak/lorem.input");
     let expected =
         std::fs::read(&lorem_path).map_err(|e| format!("read lorem.input: {e}"))?;
+    println!("PDF under test: {}", pdf_path.display());
 
     // PB 1.10 dot density 100 dpi → at a 300-dpi scan, each dot is
     // 3 device pixels (the ratio scan_decode's grid finder is
@@ -31,7 +39,7 @@ fn main() -> Result<(), String> {
     // 12 (over-sampled). Walk the candidate render DPIs to find the
     // one where scan_decode locks on cleanly. Once we know which
     // works for typical scanner PDFs we can pick a sensible default.
-    for dpi in [200, 300, 400, 500, 600, 800] {
+    for dpi in [300, 600, 1200] {
         println!("--- render DPI {dpi} ---");
         let t0 = Instant::now();
         let pages = match render_pdf_pages(&pdf_path, dpi) {
@@ -61,15 +69,14 @@ fn main() -> Result<(), String> {
                     t1.elapsed().as_secs_f32(),
                     if match_len { "bytes match lorem.input" } else { "BYTES DIFFER" }
                 );
-                // Stop at the first DPI that fully decodes correctly.
-                if match_len {
-                    return Ok(());
-                }
+                // Walk all DPIs in this run rather than stopping
+                // at first success — useful for confirming the
+                // ladder behaves the same across the candidate set.
             }
             Err(e) => {
                 println!("  scan_decode failed: {e}");
             }
         }
     }
-    Err("no render DPI produced a clean decode".into())
+    Ok(())
 }
