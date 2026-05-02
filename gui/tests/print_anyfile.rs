@@ -104,7 +104,7 @@ fn print_tab_encodes_raw_file_on_the_fly_and_round_trips_via_pdf() {
 
     // 4. Save as PDF.
     let pdf_path = tmp.join("anyfile.pdf");
-    save_pages_as_pdf(&pages, 600, "anyfile", &pdf_path)
+    save_pages_as_pdf(&pages, 600, None, "anyfile", &pdf_path)
         .expect("PDF save should succeed");
 
     // 5. Render the PDF back via pdfium. Skip if pdfium not present.

@@ -85,7 +85,12 @@ fn main() -> Result<(), String> {
             height: p.height,
         })
         .collect();
-    save_pages_as_pdf(&print_pages, 600, "lorem", &pdf_path)
+    let header = print::PdfHeader {
+        filename: "lorem.input".into(),
+        modified_unix_secs: Some(1_714_550_400), // 2024-05-01 08:00 UTC
+        origsize: lorem.len() as u64,
+    };
+    save_pages_as_pdf(&print_pages, 600, Some(&header), "lorem", &pdf_path)
         .map_err(|e| format!("save pdf: {e}"))?;
     println!(
         "saved PDF: {} ({} bytes)",

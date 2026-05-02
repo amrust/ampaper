@@ -70,7 +70,7 @@ fn save_pages_as_pdf_writes_a_real_pdf() {
         .collect();
 
     let out = tmp.join("smoke.pdf");
-    save_pages_as_pdf(&print_pages, 600, "smoke", &out).expect("PDF save should succeed");
+    save_pages_as_pdf(&print_pages, 600, None, "smoke", &out).expect("PDF save should succeed");
 
     let bytes = std::fs::read(&out).unwrap();
     // Every PDF starts with `%PDF-` (typically `%PDF-1.x` or `%PDF-2.0`).
@@ -109,7 +109,7 @@ fn save_pages_as_pdf_rejects_zero_dpi() {
         height: 100,
     }];
     let out = tmp.join("bad.pdf");
-    let err = save_pages_as_pdf(&pages, 0, "bad", &out).expect_err("dpi=0 must error");
+    let err = save_pages_as_pdf(&pages, 0, None, "bad", &out).expect_err("dpi=0 must error");
     assert!(format!("{err}").contains("DPI"));
 }
 
@@ -120,6 +120,6 @@ fn save_pages_as_pdf_rejects_empty_input() {
     std::fs::create_dir_all(&tmp).unwrap();
 
     let out = tmp.join("empty.pdf");
-    let err = save_pages_as_pdf(&[], 600, "empty", &out).expect_err("empty pages must error");
+    let err = save_pages_as_pdf(&[], 600, None, "empty", &out).expect_err("empty pages must error");
     assert!(format!("{err}").contains("no pages"));
 }

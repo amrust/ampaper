@@ -85,7 +85,7 @@ fn encode_save_pdf_render_decode_round_trips_bytes() {
         })
         .collect();
     let pdf_path = tmp.join("round-trip.pdf");
-    save_pages_as_pdf(&print_pages, 600, "round-trip", &pdf_path)
+    save_pages_as_pdf(&print_pages, 600, None, "round-trip", &pdf_path)
         .expect("PDF save should succeed");
 
     // 3. Render back via pdfium. Skip the test if pdfium isn't

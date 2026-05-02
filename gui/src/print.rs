@@ -32,6 +32,19 @@ pub struct PrintPage {
     pub height: u32,
 }
 
+/// Metadata for the PaperBack-1.10-style header line drawn at the top
+/// of each PDF page. The header reads:
+///
+///   `<filename> [<yyyy-mm-dd hh:mm:ss>, <N> bytes] Page X of Y`
+///
+/// `modified_unix_secs == None` skips the date/time.
+#[derive(Clone, Debug)]
+pub struct PdfHeader {
+    pub filename: String,
+    pub modified_unix_secs: Option<u64>,
+    pub origsize: u64,
+}
+
 #[derive(Debug)]
 pub enum PrintError {
     /// User clicked Cancel in the print dialog. Not really an error;
@@ -64,6 +77,130 @@ impl core::fmt::Display for PrintError {
 }
 
 impl std::error::Error for PrintError {}
+
+/// Re-derive a `PageGeometry` whose `nx`/`ny` are just big enough
+/// for the cells the data actually needs. The encoder then produces
+/// a tight bitmap with the sync raster wrapping the data block area
+/// (instead of wrapping a full Letter page of mostly-blank cells).
+///
+/// Used by the PDF save path on raw inputs — runs a quick "trial
+/// encode" to learn how many cells the data takes, computes the
+/// required bitmap dimensions, and returns a geometry the real
+/// encode pass uses. Belt-and-suspenders: we still feed
+/// pad_to_full_page=false so the trial encode places only the
+/// cells it needs.
+fn shrink_geometry_to_data(
+    geometry: &ampaper::page::PageGeometry,
+    data_len_bytes: usize,
+    redundancy: u8,
+    is_v2: bool,
+) -> ampaper::page::PageGeometry {
+    use ampaper::block::NDATA;
+    use ampaper::page::CELL_SIZE_DOTS;
+
+    // Number of data blocks the payload needs. v2 adds a 16-byte
+    // GCM tag so the ciphertext is 16 bytes longer than the
+    // plaintext input.
+    let datasize = if is_v2 {
+        data_len_bytes + 16
+    } else {
+        // v1 zero-pads to 16-byte alignment before splitting into
+        // 90-byte blocks (Printer.cpp:417).
+        (data_len_bytes + 15) & !15
+    };
+    let n_data = datasize.div_ceil(NDATA);
+    let r = redundancy as usize;
+    let nstring = n_data.div_ceil(r.max(1));
+    let cells_per_string = if is_v2 { nstring + 2 } else { nstring + 1 };
+    let strings = r + 1;
+    let total_cells = strings * cells_per_string;
+
+    // Lay the cells out at most `nx_max` columns wide so they form
+    // a short, page-shaped rectangle, and respect the encoder's
+    // minimum-page-size guards (redundancy+1 cols, 3 rows,
+    // 2*redundancy+2 cells). Pick nx = redundancy+1 — the smallest
+    // valid width — and ny = max(3, ceil(total / nx)) so the
+    // bitmap is roughly square-ish for small inputs and grows in
+    // height as the payload gets bigger.
+    let nx_max = geometry.nx().max(1) as usize;
+    let nx_min = r + 1;
+    let nx = nx_min.min(nx_max).max(nx_min);
+    let ny_min_for_cells = total_cells.div_ceil(nx);
+    let ny = ny_min_for_cells.max(3);
+
+    let dx = geometry.dx();
+    let dy = geometry.dy();
+    let cell_pitch_x = CELL_SIZE_DOTS as u32 * dx;
+    let cell_pitch_y = CELL_SIZE_DOTS as u32 * dy;
+    let target_width = nx as u32 * cell_pitch_x + geometry.px() + 2 * geometry.border();
+    let target_height = ny as u32 * cell_pitch_y + geometry.py() + 2 * geometry.border();
+
+    ampaper::page::PageGeometry {
+        width: target_width,
+        height: target_height,
+        ..*geometry
+    }
+}
+
+/// Format the header line drawn at the top of every PDF page. Shape:
+///   `"<filename> [<yyyy-mm-dd hh:mm:ss>, <N> bytes] Page X of Y"`
+/// Skips the date/time block when modified_unix_secs is None.
+fn format_header_text(h: &PdfHeader, page_idx: usize, page_count: usize) -> String {
+    let mut bracket = String::new();
+    if let Some(secs) = h.modified_unix_secs {
+        bracket.push_str(&format_unix_secs_iso(secs));
+        bracket.push_str(", ");
+    }
+    bracket.push_str(&format_byte_count(h.origsize));
+    bracket.push_str(" bytes");
+    format!(
+        "{} [{}] Page {} of {}",
+        h.filename,
+        bracket,
+        page_idx + 1,
+        page_count
+    )
+}
+
+/// Convert seconds-since-1970 to `YYYY-MM-DD HH:MM:SS` (UTC) without
+/// pulling in chrono / time. Civil-date math from Howard Hinnant's
+/// "days_from_civil" derivation.
+fn format_unix_secs_iso(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let hh = secs_of_day / 3600;
+    let mm = (secs_of_day % 3600) / 60;
+    let ss = secs_of_day % 60;
+    let (y, m, d) = days_to_civil(days + 719_468);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+}
+
+fn days_to_civil(z: i64) -> (i64, u32, u32) {
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Render a byte count with thousands separators.
+fn format_byte_count(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
 
 /// PaperBack 1.10's drop-any-file UX: each input is either a
 /// pre-rendered bitmap (BMP/PNG/JPG — pass straight through), a PDF
@@ -111,7 +248,12 @@ pub fn prepare_print_pages(
                 out.extend(pages);
             }
             InputKind::Raw => {
-                // Encode this file through the codec.
+                // Encode this file through the codec. We shrink the
+                // PageGeometry to just the size the data needs —
+                // the sync-raster border (print_border:true) then
+                // wraps the actual data area, not a full Letter
+                // page of mostly-blank cells. Matches PB 1.10's
+                // print appearance.
                 let bytes = std::fs::read(p).map_err(|e| PrintError::Io {
                     path: p.display().to_string(),
                     message: e.to_string(),
@@ -125,11 +267,35 @@ pub fn prepare_print_pages(
                     modified: 0,
                     attributes: 0x80,
                 };
+                let is_v2 = v2_password.is_some_and(|pw| !pw.is_empty());
+                let payload_len = if encode_options.compress {
+                    // bzip2 typically compresses text 2-4×; we'd
+                    // need to actually compress to know exactly.
+                    // Cheap: compress here to learn the size, then
+                    // feed the compressed bytes to encode (which
+                    // would compress again — encode does its own
+                    // bzip2). To avoid double-compression, do the
+                    // compress step ourselves and feed the encoder
+                    // a non-compressed copy with compress:false.
+                    ampaper::bz::compress(&bytes, ampaper::bz::BlockSize::Max).len()
+                } else {
+                    bytes.len()
+                };
+                let shrunk_geometry = shrink_geometry_to_data(
+                    &encode_options.geometry,
+                    payload_len,
+                    encode_options.redundancy,
+                    is_v2,
+                );
+                let shrunk_options = ampaper::encoder::EncodeOptions {
+                    geometry: shrunk_geometry,
+                    ..*encode_options
+                };
                 let encoded = match v2_password {
                     Some(pw) if !pw.is_empty() => {
                         ampaper::encoder::encode_v2(
                             &bytes,
-                            encode_options,
+                            &shrunk_options,
                             &meta,
                             pw.as_bytes(),
                         )
@@ -138,7 +304,7 @@ pub fn prepare_print_pages(
                             message: format!("encode_v2: {e}"),
                         })?
                     }
-                    _ => ampaper::encoder::encode(&bytes, encode_options, &meta)
+                    _ => ampaper::encoder::encode(&bytes, &shrunk_options, &meta)
                         .map_err(|e| PrintError::Io {
                             path: p.display().to_string(),
                             message: format!("encode: {e}"),
@@ -302,12 +468,14 @@ pub fn print_pages(_pages: &[PrintPage], _doc_name: &str) -> Result<(), PrintErr
 pub fn save_pages_as_pdf(
     pages: &[PrintPage],
     dpi: u32,
+    header: Option<&PdfHeader>,
     doc_name: &str,
     path: &Path,
 ) -> Result<(), PrintError> {
     use printpdf::{
-        ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage,
-        PdfSaveOptions, RawImage, RawImageData, RawImageFormat, XObjectTransform,
+        BuiltinFont, ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument,
+        PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, RawImage, RawImageData,
+        RawImageFormat, TextItem, XObjectTransform,
     };
 
     if pages.is_empty() {
@@ -324,11 +492,30 @@ pub fn save_pages_as_pdf(
     }
 
     let mut doc = PdfDocument::new(doc_name);
+
+    // Page layout — Letter portrait, with PB-1.10-style margins and
+    // a header line at the top.
+    //
+    //   ┌──────────────────────────────────┐ ← y = LETTER_HEIGHT_PT
+    //   │  HEADER (Helvetica, ~10pt)       │   ↑ ~0.5" margin
+    //   │----------------------------------│
+    //   │                                  │
+    //   │       [centered bitmap]          │
+    //   │                                  │
+    //   └──────────────────────────────────┘ ← y = 0
+    //
+    // PDF coordinates are bottom-left origin, so larger y = higher
+    // on the page. The bitmap's `translate_y` is its bottom edge.
+    const LETTER_WIDTH_PT: f32 = 612.0; // 8.5 in × 72
+    const LETTER_HEIGHT_PT: f32 = 792.0; // 11 in × 72
+    const PAGE_MARGIN_PT: f32 = 36.0; // 0.5 inch
+    const HEADER_FONT_SIZE_PT: f32 = 10.0;
+    const HEADER_GAP_PT: f32 = 6.0; // gap between header text baseline and bitmap top
     let mut pdf_pages = Vec::with_capacity(pages.len());
 
-    for page in pages {
-        // Embed the raw 8-bit grayscale bytes. printpdf has an R8
-        // (single-channel u8) format, exactly what our codec emits.
+    let helvetica = PdfFontHandle::Builtin(BuiltinFont::Helvetica);
+
+    for (i, page) in pages.iter().enumerate() {
         let raw = RawImage {
             width: page.width as usize,
             height: page.height as usize,
@@ -338,21 +525,74 @@ pub fn save_pages_as_pdf(
         };
         let image_id = doc.add_image(&raw);
 
-        // Place the image at the origin with the right DPI transform.
-        // printpdf's XObjectTransform.dpi tells the layer "this image
-        // is meant to print at this many pixels per inch" — combined
-        // with the page size below, that fixes pixel pitch on paper.
-        let ops = vec![Op::UseXobject {
+        let img_width_pt = page.width as f32 * 72.0 / dpi as f32;
+        let img_height_pt = page.height as f32 * 72.0 / dpi as f32;
+
+        // Pages: Letter unless header is None AND bitmap is bigger
+        // than Letter (caller knows what they want — keep the
+        // tight-bitmap fallback for testing). With header on, always
+        // Letter.
+        let use_letter_page = header.is_some()
+            || (img_width_pt <= LETTER_WIDTH_PT && img_height_pt <= LETTER_HEIGHT_PT);
+        let (page_width_pt, page_height_pt) = if use_letter_page {
+            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
+        } else {
+            (img_width_pt, img_height_pt)
+        };
+
+        // Bitmap bottom-left coordinate. Centered horizontally.
+        // Vertically: top edge sits PAGE_MARGIN + header_h + gap
+        // below the page top when header is on; just PAGE_MARGIN
+        // below the top otherwise.
+        let header_band_pt = if header.is_some() {
+            HEADER_FONT_SIZE_PT + HEADER_GAP_PT
+        } else {
+            0.0
+        };
+        let img_x_pt = ((page_width_pt - img_width_pt) / 2.0).max(0.0);
+        let img_top_pt = page_height_pt - PAGE_MARGIN_PT - header_band_pt;
+        let img_bottom_pt = img_top_pt - img_height_pt;
+        let img_y_pt = img_bottom_pt.max(0.0);
+
+        let mut ops = Vec::new();
+
+        if let Some(h) = header {
+            let header_text = format_header_text(h, i, pages.len());
+            // Header baseline sits PAGE_MARGIN below top edge
+            // (in PDF coords: y = page_height - PAGE_MARGIN).
+            let header_baseline_y_pt = page_height_pt - PAGE_MARGIN_PT;
+            let header_x_pt = PAGE_MARGIN_PT;
+            ops.extend([
+                Op::StartTextSection,
+                Op::SetFont {
+                    font: helvetica.clone(),
+                    size: Pt(HEADER_FONT_SIZE_PT),
+                },
+                Op::SetTextCursor {
+                    pos: Point {
+                        x: Pt(header_x_pt),
+                        y: Pt(header_baseline_y_pt),
+                    },
+                },
+                Op::ShowText {
+                    items: vec![TextItem::Text(header_text)],
+                },
+                Op::EndTextSection,
+            ]);
+        }
+
+        ops.push(Op::UseXobject {
             id: image_id,
             transform: XObjectTransform {
+                translate_x: Some(Pt(img_x_pt)),
+                translate_y: Some(Pt(img_y_pt)),
                 dpi: Some(dpi as f32),
                 ..Default::default()
             },
-        }];
+        });
 
-        // PDF page size = bitmap inches, converted to Mm.
-        let width_mm = (page.width as f32 / dpi as f32) * 25.4;
-        let height_mm = (page.height as f32 / dpi as f32) * 25.4;
+        let width_mm = page_width_pt * 25.4 / 72.0;
+        let height_mm = page_height_pt * 25.4 / 72.0;
         pdf_pages.push(PdfPage::new(Mm(width_mm), Mm(height_mm), ops));
     }
 

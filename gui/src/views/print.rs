@@ -17,7 +17,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::print::{prepare_print_pages, print_pages, save_pages_as_pdf, PrintError, PrintPage};
+use crate::print::{
+    prepare_print_pages, print_pages, save_pages_as_pdf, PdfHeader, PrintError, PrintPage,
+};
 use crate::views::encode::EncodeSettings;
 
 pub struct PrintView {
@@ -230,7 +232,8 @@ impl PrintView {
             self.last_status = "PDF save cancelled.".into();
             return;
         };
-        match save_pages_as_pdf(&pages, self.print_dpi, &doc_name, &path) {
+        let header = self.build_pdf_header();
+        match save_pages_as_pdf(&pages, self.print_dpi, header.as_ref(), &doc_name, &path) {
             Ok(()) => {
                 self.last_status = format!(
                     "Saved {} page{} to {}",
@@ -243,6 +246,32 @@ impl PrintView {
                 self.last_status = format!("PDF save failed: {e}");
             }
         }
+    }
+
+    /// Build the PaperBack-1.10-style header line metadata from the
+    /// first queued input. PB 1.10 prints
+    /// `<filename> [<date_time>, <bytes>] Page X of Y` at the top of
+    /// every page; we mirror it. Returns None when we can't get
+    /// usable metadata (e.g., no files queued or stat failed) — in
+    /// that case save_pages_as_pdf falls back to a header-less PDF.
+    fn build_pdf_header(&self) -> Option<PdfHeader> {
+        let path = self.queued_paths.first()?;
+        let meta = std::fs::metadata(path).ok()?;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "input".to_string());
+        let modified_unix_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        Some(PdfHeader {
+            filename,
+            modified_unix_secs,
+            origsize: meta.len(),
+        })
     }
 
     /// Build the page list, encoding any raw inputs through the

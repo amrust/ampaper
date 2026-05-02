@@ -86,7 +86,7 @@ fn round_trip(blocks_per_inch: u32) {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let pdf_path = tmp.join("out.pdf");
-    save_pages_as_pdf(&print_pages, 600, "lorem", &pdf_path)
+    save_pages_as_pdf(&print_pages, 600, None, "lorem", &pdf_path)
         .expect("save_pages_as_pdf should succeed");
 
     let rendered = match render_pdf_pages(&pdf_path, DEFAULT_PDF_RENDER_DPI) {

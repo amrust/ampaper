@@ -67,7 +67,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let out = std::env::temp_dir().join(format!("lorem-{label}.pdf"));
-        save_pages_as_pdf(&print_pages, 600, "lorem", &out).map_err(|e| format!("{e}"))?;
+        save_pages_as_pdf(&print_pages, 600, None, "lorem", &out).map_err(|e| format!("{e}"))?;
         let size = std::fs::metadata(&out).map_err(|e| format!("{e}"))?.len();
         println!(
             "{label:>10} pad_to_full_page={pad}  ->  {} bytes  ({})",
