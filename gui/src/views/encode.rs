@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker::{EncodeJob, EncodeMessage, EncodeRequest};
 
-/// Paper-size preset for the geometry section.
+/// Paper-size preset for the geometry section. Used by both the
+/// Encode tab (encoding controls) and the Print tab (which encodes
+/// raw inputs on the fly using these settings — see
+/// `views::print::encode_options_from_settings`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaperSize {
     UsLetter,
@@ -44,7 +47,7 @@ impl PaperSize {
 
     /// Page dimensions in (width_inches, height_inches). Used with
     /// `printer_dpi` to derive pixel width/height.
-    fn inches(self) -> (f32, f32) {
+    pub fn inches(self) -> (f32, f32) {
         match self {
             Self::UsLetter => (8.5, 11.0),
             Self::A4 => (8.27, 11.69),

@@ -1,34 +1,34 @@
 // Print tab.
 //
-// Pick / drag one or more BMP / PNG / JPG files and send them to a
-// printer via the standard Windows print dialog. The actual GDI
-// plumbing lives in `crate::print`; this view is thin UI on top:
-// queue → load → call print → surface result in the status bar.
+// Drop ANY file (or a pre-rendered ampaper bitmap, or an
+// already-encoded PDF) and ampaper:
+//   - if the input looks like a bitmap or PDF, passes it through;
+//   - otherwise, encodes it on the fly via the Encode tab's settings
+//     (paper size, redundancy, compression, v2 password).
+// Then sends the resulting page bitmaps to a printer (Windows GDI)
+// or saves them as a multi-page PDF (cross-platform).
 //
-// Cross-platform: this view compiles everywhere; the print call
-// returns `PlatformUnsupported` outside Windows and the button is
-// greyed via `Tab::is_available()`. When M9 grows Linux (CUPS) /
-// macOS (CGContext) backends, the `crate::print::print_pages` entry
-// will dispatch internally and this view stays the same.
+// This mirrors PaperBack 1.10's "drag a file in, hit print" UX:
+// the user doesn't have to encode separately on the Encode tab and
+// then drag bitmaps over here unless they want explicit control
+// over where the bitmap files land.
 
 use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::print::{PrintError, pages_from_paths, print_pages, save_pages_as_pdf};
+use crate::print::{prepare_print_pages, print_pages, save_pages_as_pdf, PrintError, PrintPage};
+use crate::views::encode::EncodeSettings;
 
 pub struct PrintView {
     queued_paths: Vec<PathBuf>,
     /// DPI used for direct printing AND for sizing PDF pages. Defaults
     /// to 600 (the EncodeView default; a typical consumer laser).
-    /// User adjusts when their encode used a different DPI — without
-    /// this, a 4800×6600 bitmap saved as PDF at the wrong DPI would
-    /// come out the wrong physical size.
     pub print_dpi: u32,
-    /// Status text drawn at the bottom of the panel after a print
-    /// attempt. Populated synchronously since PrintDlgExW is modal —
-    /// the print dialog blocks the UI thread until the user chooses
-    /// or cancels, by Windows convention.
+    /// v2 encryption password. Empty disables v2 (raw inputs encode
+    /// as v1; pre-encoded bitmaps just pass through). Like the Encode
+    /// tab, we never persist this — it's session state only.
+    v2_password: String,
     last_status: String,
 }
 
@@ -37,22 +37,23 @@ impl Default for PrintView {
         Self {
             queued_paths: Vec::new(),
             print_dpi: 600,
+            v2_password: String::new(),
             last_status: String::new(),
         }
     }
 }
 
 impl PrintView {
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    pub fn show(&mut self, ui: &mut egui::Ui, encode_settings: &EncodeSettings) {
         self.poll_dropped_files(ui.ctx());
 
         ui.heading("Print");
         ui.add_space(6.0);
         ui.label(
-            "Drag bitmaps into this window, or pick them with the button. \
-             Send them to a printer directly, or save a print-ready PDF \
-             for later. Set the DPI to match what you used at encode time \
-             so each dot lands on one device pixel on paper.",
+            "Drop ANY file into this window — text, image, archive, \
+             whatever — and ampaper encodes it on the fly using your \
+             Encode tab settings, then prints or saves a print-ready \
+             PDF. Pre-encoded bitmaps and PDFs are passed through as-is.",
         );
         ui.add_space(12.0);
         ui.separator();
@@ -62,7 +63,9 @@ impl PrintView {
         ui.add_space(8.0);
         self.show_dpi_row(ui);
         ui.add_space(8.0);
-        self.show_action_row(ui);
+        self.show_v2_row(ui, encode_settings);
+        ui.add_space(8.0);
+        self.show_action_row(ui, encode_settings);
 
         if !self.last_status.is_empty() {
             ui.add_space(12.0);
@@ -100,7 +103,7 @@ impl PrintView {
 
     fn show_input_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Bitmaps to print:");
+            ui.label("Input file(s):");
             if self.queued_paths.is_empty() {
                 ui.monospace("(drop files here, or use the button)");
             } else {
@@ -109,9 +112,7 @@ impl PrintView {
         });
         ui.horizontal(|ui| {
             if ui.button("Open files...").clicked()
-                && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Bitmap", &["bmp", "png", "jpg", "jpeg"])
-                    .pick_files()
+                && let Some(paths) = rfd::FileDialog::new().pick_files()
             {
                 self.queued_paths = paths;
             }
@@ -128,11 +129,11 @@ impl PrintView {
 
     fn show_dpi_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("DPI:");
+            ui.label("PDF page DPI:");
             ui.add(egui::DragValue::new(&mut self.print_dpi).range(150..=2400));
             ui.label(
                 egui::RichText::new(
-                    "Use the same value you set in Encode → Printer DPI.",
+                    "PDF page sizing only — does not affect printer DPI.",
                 )
                 .small()
                 .weak(),
@@ -140,46 +141,64 @@ impl PrintView {
         });
     }
 
-    fn show_action_row(&mut self, ui: &mut egui::Ui) {
+    fn show_v2_row(&mut self, ui: &mut egui::Ui, encode_settings: &EncodeSettings) {
+        // Only show the password field when the Encode tab settings
+        // ask for v2 encryption. Otherwise raw inputs encode as v1
+        // and the password isn't used.
+        if encode_settings.v2_encrypt {
+            ui.horizontal(|ui| {
+                ui.label("v2 password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.v2_password)
+                        .password(true)
+                        .desired_width(260.0),
+                );
+            });
+            if self.v2_password.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Encode tab is set to v2 — raw files need a password. \
+                         (Pre-encoded bitmaps and PDFs pass through unchanged.)",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Raw file inputs will be encoded as v1 (PaperBack-1.10-\
+                     compatible). Toggle \"Encrypt with AES-256-GCM\" on the \
+                     Encode tab if you want v2 here.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+    }
+
+    fn show_action_row(&mut self, ui: &mut egui::Ui, encode_settings: &EncodeSettings) {
         let have_files = !self.queued_paths.is_empty();
         ui.horizontal(|ui| {
-            // Direct print — Windows only at this milestone.
             let print_enabled = have_files && cfg!(target_os = "windows");
             ui.add_enabled_ui(print_enabled, |ui| {
                 if ui.button("Print...").clicked() {
-                    self.run_print();
+                    self.run_print(encode_settings);
                 }
             });
-
-            // Save as PDF — cross-platform via printpdf.
             ui.add_enabled_ui(have_files, |ui| {
                 if ui.button("Save as PDF...").clicked() {
-                    self.run_save_pdf();
+                    self.run_save_pdf(encode_settings);
                 }
             });
         });
     }
 
-    fn run_print(&mut self) {
-        // Load all images first; if any fail, surface the error
-        // before opening the print dialog (UX nit: avoid making the
-        // user click through a printer picker just to see a "failed
-        // to load" error after).
-        self.last_status = "Loading bitmaps...".into();
-        let pages = match pages_from_paths(&self.queued_paths) {
-            Ok(p) => p,
-            Err(e) => {
-                self.last_status = format!("{e}");
-                return;
-            }
+    fn run_print(&mut self, encode_settings: &EncodeSettings) {
+        let Some(pages) = self.prepare(encode_settings) else {
+            return;
         };
-
         let doc_name = self.doc_name();
-
-        // PrintDlgExW is modal — blocks the UI thread until the user
-        // chooses a printer or cancels. egui's frame loop pauses
-        // while it's open, which is fine; the Windows print picker
-        // is the user's expected experience.
         match print_pages(&pages, &doc_name) {
             Ok(()) => {
                 self.last_status = format!(
@@ -197,16 +216,10 @@ impl PrintView {
         }
     }
 
-    fn run_save_pdf(&mut self) {
-        self.last_status = "Loading bitmaps...".into();
-        let pages = match pages_from_paths(&self.queued_paths) {
-            Ok(p) => p,
-            Err(e) => {
-                self.last_status = format!("{e}");
-                return;
-            }
+    fn run_save_pdf(&mut self, encode_settings: &EncodeSettings) {
+        let Some(pages) = self.prepare(encode_settings) else {
+            return;
         };
-
         let doc_name = self.doc_name();
         let suggested = format!("{doc_name}.pdf");
         let Some(path) = rfd::FileDialog::new()
@@ -217,7 +230,6 @@ impl PrintView {
             self.last_status = "PDF save cancelled.".into();
             return;
         };
-
         match save_pages_as_pdf(&pages, self.print_dpi, &doc_name, &path) {
             Ok(()) => {
                 self.last_status = format!(
@@ -233,6 +245,33 @@ impl PrintView {
         }
     }
 
+    /// Build the page list, encoding any raw inputs through the
+    /// codec. Returns `None` when something failed; in that case we
+    /// also wrote the error to `last_status` for the user.
+    fn prepare(&mut self, encode_settings: &EncodeSettings) -> Option<Vec<PrintPage>> {
+        self.last_status = "Preparing pages...".into();
+        let opts = encode_options_from_settings(encode_settings);
+        let v2 = if encode_settings.v2_encrypt && !self.v2_password.is_empty() {
+            Some(self.v2_password.as_str())
+        } else {
+            None
+        };
+        if encode_settings.v2_encrypt && self.v2_password.is_empty() {
+            // The Encode tab asks for v2 but we don't have a password —
+            // fail loudly instead of silently emitting v1.
+            self.last_status =
+                "v2 encryption is enabled in Settings but no password was supplied.".into();
+            return None;
+        }
+        match prepare_print_pages(&self.queued_paths, &opts, v2) {
+            Ok(pages) => Some(pages),
+            Err(e) => {
+                self.last_status = format!("{e}");
+                None
+            }
+        }
+    }
+
     fn doc_name(&self) -> String {
         self.queued_paths
             .first()
@@ -240,5 +279,32 @@ impl PrintView {
             .and_then(|s| s.to_str())
             .unwrap_or("ampaper")
             .to_string()
+    }
+}
+
+/// Build a full [`ampaper::encoder::EncodeOptions`] from the
+/// persisted [`EncodeSettings`] + paper-size lookup. Mirrors the
+/// equivalent code on the Encode tab (`build_request`); kept in
+/// sync because both consume the same settings object.
+fn encode_options_from_settings(
+    settings: &EncodeSettings,
+) -> ampaper::encoder::EncodeOptions {
+    use ampaper::page::{BLACK_PAPER, PageGeometry};
+    let (in_w, in_h) = settings.paper_size.inches();
+    let width = (in_w * settings.printer_dpi as f32) as u32;
+    let height = (in_h * settings.printer_dpi as f32) as u32;
+    ampaper::encoder::EncodeOptions {
+        geometry: PageGeometry {
+            ppix: settings.printer_dpi,
+            ppiy: settings.printer_dpi,
+            dpi: settings.blocks_per_inch,
+            dot_percent: settings.dot_percent,
+            width,
+            height,
+            print_border: false,
+        },
+        redundancy: settings.redundancy,
+        compress: settings.compress,
+        black: BLACK_PAPER,
     }
 }

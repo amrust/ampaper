@@ -65,18 +65,173 @@ impl core::fmt::Display for PrintError {
 
 impl std::error::Error for PrintError {}
 
-/// Read each path as an image, convert to 8-bit grayscale, and pack
-/// into [`PrintPage`]s ready for [`print_pages`]. Cross-platform —
-/// just file I/O + image decoding.
-pub fn pages_from_paths(paths: &[impl AsRef<Path>]) -> Result<Vec<PrintPage>, PrintError> {
+/// PaperBack 1.10's drop-any-file UX: each input is either a
+/// pre-rendered bitmap (BMP/PNG/JPG — pass straight through), a PDF
+/// (already-rendered output OR scanner output — keep as-is for
+/// printing), or anything else (raw file → encode through the
+/// codec using the supplied settings).
+///
+/// Returns the bitmaps in the order the user dropped them; raw
+/// inputs that span multiple pages produce multiple bitmaps in
+/// place. The caller hands the result to [`print_pages`] or
+/// [`save_pages_as_pdf`] without caring which path each came from.
+pub fn prepare_print_pages(
+    paths: &[impl AsRef<Path>],
+    encode_options: &ampaper::encoder::EncodeOptions,
+    v2_password: Option<&str>,
+) -> Result<Vec<PrintPage>, PrintError> {
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
         let p = path.as_ref();
-        let img = image::open(p).map_err(|e| PrintError::Io {
-            path: p.display().to_string(),
+        let kind = sniff_kind(p)?;
+        match kind {
+            InputKind::Image => {
+                let img = image::open(p).map_err(|e| PrintError::Io {
+                    path: p.display().to_string(),
+                    message: e.to_string(),
+                })?;
+                let luma = img.to_luma8();
+                let (w, h) = luma.dimensions();
+                out.push(PrintPage {
+                    bitmap: luma.into_raw(),
+                    width: w,
+                    height: h,
+                });
+            }
+            InputKind::Pdf => {
+                // PDF on the Print tab is treated as "this is
+                // already a printable doc" — pass it through to
+                // print_pages or copy verbatim for save-as-pdf.
+                // For now we render it back to bitmaps so the same
+                // PrintPage flow handles all cases. A future
+                // optimisation could short-circuit "PDF in → PDF
+                // out" without re-rendering, but that's pure
+                // efficiency.
+                let pages = render_pdf_via_pdfium(p)?;
+                out.extend(pages);
+            }
+            InputKind::Raw => {
+                // Encode this file through the codec.
+                let bytes = std::fs::read(p).map_err(|e| PrintError::Io {
+                    path: p.display().to_string(),
+                    message: e.to_string(),
+                })?;
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("input.bin");
+                let meta = ampaper::encoder::FileMeta {
+                    name,
+                    modified: 0,
+                    attributes: 0x80,
+                };
+                let encoded = match v2_password {
+                    Some(pw) if !pw.is_empty() => {
+                        ampaper::encoder::encode_v2(
+                            &bytes,
+                            encode_options,
+                            &meta,
+                            pw.as_bytes(),
+                        )
+                        .map_err(|e| PrintError::Io {
+                            path: p.display().to_string(),
+                            message: format!("encode_v2: {e}"),
+                        })?
+                    }
+                    _ => ampaper::encoder::encode(&bytes, encode_options, &meta)
+                        .map_err(|e| PrintError::Io {
+                            path: p.display().to_string(),
+                            message: format!("encode: {e}"),
+                        })?,
+                };
+                for page in encoded {
+                    out.push(PrintPage {
+                        bitmap: page.bitmap,
+                        width: page.width,
+                        height: page.height,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What the first few bytes of a file say about its format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputKind {
+    Image,
+    Pdf,
+    Raw,
+}
+
+fn sniff_kind(path: &Path) -> Result<InputKind, PrintError> {
+    use std::io::Read;
+    let mut sniff = [0u8; 8];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut sniff))
+        .map_err(|e| PrintError::Io {
+            path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let luma = img.to_luma8();
+    let head = &sniff[..n];
+    if head.starts_with(b"%PDF-") {
+        return Ok(InputKind::Pdf);
+    }
+    // BMP "BM", PNG \x89PNG, JPEG \xFF\xD8\xFF.
+    if head.starts_with(b"BM")
+        || head.starts_with(b"\x89PNG")
+        || head.starts_with(&[0xFFu8, 0xD8, 0xFF])
+    {
+        return Ok(InputKind::Image);
+    }
+    Ok(InputKind::Raw)
+}
+
+/// Render every page of a PDF into [`PrintPage`]s via pdfium. Lives
+/// here (not just in worker.rs) so the Print tab can pass
+/// already-PDF inputs straight through without touching Decode-tab
+/// internals. Mirrors the worker.rs implementation; we tolerate the
+/// duplication because keeping print.rs's API surface
+/// self-contained is worth more than DRY.
+fn render_pdf_via_pdfium(path: &Path) -> Result<Vec<PrintPage>, PrintError> {
+    use pdfium_render::prelude::PdfRenderConfig;
+    const RENDER_DPI: u32 = 1200;
+
+    let pdfium = bind_pdfium().map_err(|e| PrintError::Io {
+        path: path.display().to_string(),
+        message: format!(
+            "PDFium library not found ({e}). Place pdfium.dll / \
+             libpdfium.so / libpdfium.dylib next to the executable, \
+             or install it system-wide. Pre-built binaries: \
+             https://github.com/bblanchon/pdfium-binaries/releases"
+        ),
+    })?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|e| PrintError::Io {
+        path: path.display().to_string(),
+        message: format!("PDFium failed to open: {e}"),
+    })?;
+    let mut out = Vec::new();
+    for page in document.pages().iter() {
+        let width_in = page.width().value / 72.0;
+        let height_in = page.height().value / 72.0;
+        let target_w = (width_in * RENDER_DPI as f32).round().max(1.0) as i32;
+        let target_h = (height_in * RENDER_DPI as f32).round().max(1.0) as i32;
+        let config = PdfRenderConfig::new()
+            .set_target_width(target_w)
+            .set_target_height(target_h)
+            .set_image_smoothing(false)
+            .set_path_smoothing(false)
+            .set_text_smoothing(false);
+        let bitmap = page.render_with_config(&config).map_err(|e| PrintError::Io {
+            path: path.display().to_string(),
+            message: format!("PDFium render: {e}"),
+        })?;
+        let dyn_image = bitmap.as_image().map_err(|e| PrintError::Io {
+            path: path.display().to_string(),
+            message: format!("PDFium bitmap → image: {e}"),
+        })?;
+        let luma = dyn_image.to_luma8();
         let (w, h) = luma.dimensions();
         out.push(PrintPage {
             bitmap: luma.into_raw(),
@@ -85,6 +240,25 @@ pub fn pages_from_paths(paths: &[impl AsRef<Path>]) -> Result<Vec<PrintPage>, Pr
         });
     }
     Ok(out)
+}
+
+fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, pdfium_render::prelude::PdfiumError> {
+    use pdfium_render::prelude::Pdfium;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir
+        && let Ok(b) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+    {
+        return Ok(Pdfium::new(b));
+    }
+    if let Ok(b) =
+        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
+    {
+        return Ok(Pdfium::new(b));
+    }
+    let system = Pdfium::bind_to_system_library()?;
+    Ok(Pdfium::new(system))
 }
 
 #[cfg(windows)]

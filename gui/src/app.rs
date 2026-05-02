@@ -167,11 +167,17 @@ impl eframe::App for AmpaperApp {
         // — otherwise the central region falls through to the much
         // darker window fill, which makes the content area look
         // pitch-black against the medium-grey side panels.
+        // The Print tab encodes raw files on the fly using the
+        // Encode tab's settings (paper size, redundancy, compress,
+        // v2 encrypt). Borrow them through to avoid duplicating the
+        // settings state across two tabs — there's only one set of
+        // codec defaults; both tabs share it.
+        let encode_settings = self.encode.settings.clone();
         egui::CentralPanel::default().show_inside(ui, |ui| match self.tab {
             Tab::Encode => self.encode.show(ui),
             Tab::Decode => self.decode.show(ui),
             Tab::Settings => self.settings.show(ui),
-            Tab::Print => self.print.show(ui),
+            Tab::Print => self.print.show(ui, &encode_settings),
             Tab::ScanDevice => views::stubs::show_scan_device_stub(ui),
         });
 
