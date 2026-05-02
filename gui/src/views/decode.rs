@@ -64,13 +64,10 @@ impl DecodeView {
         ui.heading("Decode");
         ui.add_space(6.0);
         ui.label(
-            "Drag one or more scanned bitmaps or PDFs into this window, or \
-             click \"Open files...\" Reads PaperBack 1.10 v1 prints (incl. \
-             legacy AES-192) and ampaper v2 (AES-256-GCM) automatically. \
-             For PDF input, place pdfium.dll (Windows) / libpdfium.so \
-             (Linux) / libpdfium.dylib (macOS) next to the ampaper \
-             executable — pre-built binaries at \
-             github.com/bblanchon/pdfium-binaries.",
+            "Drag one or more scanned bitmaps or PDFs into this window, \
+             or click \"Open files...\" Reads PaperBack 1.10 v1 prints \
+             (incl. legacy AES-192) and ampaper v2 (AES-256-GCM) \
+             automatically.",
         );
         ui.add_space(12.0);
         ui.separator();

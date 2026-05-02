@@ -89,6 +89,21 @@ binary. They support golden-vector decoding tests against PaperBack
 - No AGPL, no GPL-2-only, no proprietary EULAs in the dependency
   graph. No copyleft conflicts.
 
+## Bundled pre-built binaries
+
+| Binary | Provenance | License |
+|---|---|---|
+| `gui/vendor/pdfium/win64/pdfium.dll` | bblanchon/pdfium-binaries (build of upstream PDFium) | PDFium itself: Apache-2.0 OR BSD-3-Clause. bblanchon repackaging: MIT. |
+
+PDFium is the PDF renderer Chrome / Edge use. ampaper-gui dynamic-
+loads it on the Decode tab whenever the user drops a PDF — no pure-
+Rust alternative is robust enough for arbitrary scanner output
+(JPEG2000, CCITT-fax, color profiles). We ship the binary in-repo
+so a fresh checkout can build offline; see
+[gui/vendor/pdfium/NOTICE.md](gui/vendor/pdfium/NOTICE.md) for the
+update process. PDFium's Apache-2.0 / BSD-3 terms are GPL-compatible,
+so this bundling is clean.
+
 ## What's excluded from this list
 
 - The original PaperBack v1.10 source under `reference/paperbak-1.10/`

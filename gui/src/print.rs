@@ -201,10 +201,10 @@ fn render_pdf_via_pdfium(path: &Path) -> Result<Vec<PrintPage>, PrintError> {
     let pdfium = bind_pdfium_local().map_err(|e| PrintError::Io {
         path: path.display().to_string(),
         message: format!(
-            "PDFium library not found ({e}). Place pdfium.dll / \
-             libpdfium.so / libpdfium.dylib next to the executable, \
-             or install it system-wide. Pre-built binaries: \
-             https://github.com/bblanchon/pdfium-binaries/releases"
+            "PDFium library not found ({e}). The expected pdfium.dll / \
+             libpdfium.so / libpdfium.dylib should ship next to the \
+             ampaper-gui binary; if it's missing, restore it from \
+             gui/vendor/pdfium/<target>/ or rebuild from a clean checkout."
         ),
     })?;
     let document = pdfium.load_pdf_from_file(path, None).map_err(|e| PrintError::Io {

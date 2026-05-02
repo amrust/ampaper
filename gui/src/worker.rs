@@ -551,12 +551,16 @@ pub fn render_pdf_pages(pdf_path: &std::path::Path, dpi: u32) -> Result<Vec<Deco
         return Err("DPI must be > 0".into());
     }
     let pdfium = bind_pdfium().map_err(|e| {
+        // Distribution builds ship pdfium next to the .exe via
+        // gui/build.rs. This branch only fires when the vendored
+        // binary went missing or the build script didn't run (e.g.,
+        // someone is running a stripped-down deployment that
+        // dropped the DLL). Surface enough detail to recover.
         format!(
-            "PDFium library not found ({e}). \
-             Place pdfium.dll (Windows) / libpdfium.so (Linux) / \
-             libpdfium.dylib (macOS) next to the executable, or install \
-             it system-wide. Pre-built binaries: \
-             https://github.com/bblanchon/pdfium-binaries/releases"
+            "PDFium library not found ({e}). The expected pdfium.dll / \
+             libpdfium.so / libpdfium.dylib should ship next to the \
+             ampaper-gui binary; if it's missing, restore it from \
+             gui/vendor/pdfium/<target>/ or rebuild from a clean checkout."
         )
     })?;
     let document = pdfium
