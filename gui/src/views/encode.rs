@@ -340,6 +340,9 @@ impl EncodeView {
             redundancy: self.settings.redundancy,
             compress: self.settings.compress,
             black: BLACK_PAPER,
+            // Compact layout — small inputs render only the cells
+            // they need; the rest of the page stays blank paper.
+            pad_to_full_page: false,
         };
         let v2_password = if self.settings.v2_encrypt {
             Some(self.v2_password.clone())

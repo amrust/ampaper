@@ -55,6 +55,7 @@ fn save_pages_as_pdf_writes_a_real_pdf() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        pad_to_full_page: false,
     };
     let pages = encode(&payload, &opts, &meta()).unwrap();
     assert_eq!(pages.len(), 1);

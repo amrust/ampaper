@@ -574,6 +574,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: page::BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let dec = DecodeOptions {
             geometry,
@@ -639,6 +640,7 @@ mod tests {
                 redundancy: r,
                 compress: false,
                 black: page::BLACK_PAPER,
+                pad_to_full_page: false,
             };
             let dec = DecodeOptions {
                 geometry,
@@ -906,6 +908,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: page::BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let pages = crate::encoder::encode_v2_with_kat(payload, &opts, &meta(), password, salt, iv)
             .expect("encode_v2 must succeed in tests");

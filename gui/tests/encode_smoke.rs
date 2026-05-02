@@ -74,6 +74,7 @@ fn worker_v1_encode_writes_bmp_per_page_and_round_trips() {
             redundancy: NGROUP_DEFAULT,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         },
         v2_password: None,
     };
@@ -118,6 +119,7 @@ fn worker_v2_encode_writes_bmp_per_page_and_round_trips_with_password() {
             redundancy: NGROUP_DEFAULT,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         },
         v2_password: Some("correct horse".into()),
     };

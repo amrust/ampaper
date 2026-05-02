@@ -1273,6 +1273,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let pages = encode(payload, &opts, &meta()).unwrap();
         let bitmap = pages[0].bitmap.clone();
@@ -1378,6 +1379,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let salt = [0x12u8; 32];
         let iv = [0x34u8; 12];
@@ -1441,6 +1443,15 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            // The intensity estimator's sharpfactor heuristic is
+            // calibrated against pages that are densely covered in
+            // dots. With `pad_to_full_page: false` (the new
+            // default) a tiny payload renders only a few rows of
+            // cells with the rest blank — fewer sharp edges, higher
+            // sharpfactor, asserts trip. Force full-page padding here
+            // so the test exercises what it was written for: scan
+            // primitives on a fully-covered PB-1.10-style page.
+            pad_to_full_page: true,
         };
         let meta = FileMeta {
             name: "scan-test.bin",

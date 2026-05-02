@@ -63,6 +63,7 @@ fn encode_save_pdf_render_decode_round_trips_bytes() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        pad_to_full_page: false,
     };
     let pages = encode(&payload, &opts, &meta()).unwrap();
 

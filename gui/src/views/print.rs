@@ -306,5 +306,8 @@ fn encode_options_from_settings(
         redundancy: settings.redundancy,
         compress: settings.compress,
         black: BLACK_PAPER,
+        // Compact layout — Print tab definitely doesn't want a full
+        // page of SuperBlock-copy fillers when the input is small.
+        pad_to_full_page: false,
     }
 }

@@ -289,8 +289,8 @@ pub fn save_pages_as_pdf(
     path: &Path,
 ) -> Result<(), PrintError> {
     use printpdf::{
-        Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, RawImageData, RawImageFormat,
-        XObjectTransform,
+        ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage,
+        PdfSaveOptions, RawImage, RawImageData, RawImageFormat, XObjectTransform,
     };
 
     if pages.is_empty() {
@@ -341,7 +341,26 @@ pub fn save_pages_as_pdf(
 
     doc.with_pages(pdf_pages);
 
-    let opts = PdfSaveOptions::default();
+    // printpdf defaults to NO compression on image streams, which
+    // makes a 5100×6600 grayscale page balloon the PDF to ~33 MB.
+    // Switch on Flate (lossless) compression — ampaper bitmaps are
+    // bimodal black/white with large white runs (especially with
+    // pad_to_full_page = false), so deflate squeezes them down by
+    // ~50–100×. Quality / max_image_size / dither only matter for
+    // lossy paths; we set format = Flate to force the codec.
+    let opts = PdfSaveOptions {
+        image_optimization: Some(ImageOptimizationOptions {
+            format: Some(ImageCompression::Flate),
+            // No re-encoding to a lossy codec, no resize, no dither —
+            // we want the original pixels through, just deflate'd.
+            quality: None,
+            max_image_size: None,
+            dither_greyscale: None,
+            convert_to_greyscale: None,
+            auto_optimize: Some(false),
+        }),
+        ..Default::default()
+    };
     let mut warnings = Vec::new();
     let bytes = doc.save(&opts, &mut warnings);
     std::fs::write(path, bytes).map_err(|e| PrintError::Io {

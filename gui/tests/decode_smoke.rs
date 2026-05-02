@@ -106,6 +106,12 @@ fn worker_v1_decode_round_trips_clean_bitmap_and_recovers_filename() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        // Full-page padding so the "≤1% damaged" classifier
+        // assertion has lots of valid cells to chew on. With compact
+        // rendering most of the page is legitimately blank paper —
+        // classified Damaged — which would be a per-test orthogonal
+        // signal from "the scan pipeline reads cells correctly."
+        pad_to_full_page: true,
     };
     let pages = encode(&payload, &opts, &meta()).unwrap();
     let bmp_path: PathBuf = tmp.join("page-001.bmp");
@@ -158,6 +164,12 @@ fn worker_v2_decode_round_trips_with_password() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        // Full-page padding so the "≤1% damaged" classifier
+        // assertion has lots of valid cells to chew on. With compact
+        // rendering most of the page is legitimately blank paper —
+        // classified Damaged — which would be a per-test orthogonal
+        // signal from "the scan pipeline reads cells correctly."
+        pad_to_full_page: true,
     };
     let salt = [0x77u8; 32];
     let iv = [0x88u8; 12];
@@ -259,6 +271,12 @@ fn worker_v2_decode_with_wrong_password_fails_cleanly() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        // Full-page padding so the "≤1% damaged" classifier
+        // assertion has lots of valid cells to chew on. With compact
+        // rendering most of the page is legitimately blank paper —
+        // classified Damaged — which would be a per-test orthogonal
+        // signal from "the scan pipeline reads cells correctly."
+        pad_to_full_page: true,
     };
     let salt = [0x55u8; 32];
     let iv = [0x66u8; 12];

@@ -85,6 +85,7 @@ fn print_tab_encodes_raw_file_on_the_fly_and_round_trips_via_pdf() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        pad_to_full_page: false,
     };
 
     // 3. prepare_print_pages should sniff "notes.txt", see it's not
@@ -163,6 +164,7 @@ fn print_tab_passes_pre_rendered_bitmap_through() {
         redundancy: NGROUP_DEFAULT,
         compress: false,
         black: BLACK_PAPER,
+        pad_to_full_page: false,
     };
     let pages = prepare_print_pages(&[bmp_path], &opts, None)
         .expect("BMP input should pass through");

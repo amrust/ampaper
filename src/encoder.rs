@@ -64,6 +64,20 @@ pub struct EncodeOptions {
     /// Pixel value for filled dots (`page::BLACK_PAPER` for paper,
     /// `page::BLACK_BMP` for the dark-gray BMP-debug palette).
     pub black: u8,
+    /// When `true`, every cell on the rendered page is filled — any
+    /// cells past the last group string are padded with extra
+    /// SuperBlock copies. This matches PaperBack 1.10's behavior
+    /// (FORMAT-V1.md §5.3, Printer.cpp:921-924) and is byte-for-byte
+    /// what 1.10 produces.
+    ///
+    /// When `false` (the default), unused cells render as blank
+    /// paper. Tiny inputs (e.g. a 1 KB text file) take only the few
+    /// rows of cells they need and the rest of the page is white,
+    /// producing a smaller, ink-cheaper, PB-1.10-print-style page.
+    /// The decoder ignores filler SuperBlock copies anyway
+    /// (FORMAT-V1.md §5.3 calls them "never hurt") so binary-compat
+    /// for *decode* is preserved either way.
+    pub pad_to_full_page: bool,
 }
 
 impl Default for EncodeOptions {
@@ -81,6 +95,7 @@ impl Default for EncodeOptions {
             redundancy: crate::block::NGROUP_DEFAULT,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         }
     }
 }
@@ -376,15 +391,21 @@ fn encode_one_page(
 
     // --- Fill remaining cells with extra SuperBlock copies ----------
     // Printer.cpp:921-924. Trailing cells get superblock copies — the
-    // decoder can pick up the page metadata from any of them.
-    let used_cells: std::collections::HashSet<u32> = placed.iter().map(|p| p.cell_index).collect();
-    let total_cells = nx * options.geometry.ny();
-    for cell in 0..total_cells {
-        if !used_cells.contains(&cell) {
-            placed.push(PlacedBlock {
-                cell_index: cell,
-                bytes: superblock_bytes,
-            });
+    // decoder can pick up the page metadata from any of them. Skipped
+    // when `pad_to_full_page = false` (the default), in which case
+    // those cells render as blank paper for a compact, PB-1.10-style
+    // appearance on small inputs.
+    if options.pad_to_full_page {
+        let used_cells: std::collections::HashSet<u32> =
+            placed.iter().map(|p| p.cell_index).collect();
+        let total_cells = nx * options.geometry.ny();
+        for cell in 0..total_cells {
+            if !used_cells.contains(&cell) {
+                placed.push(PlacedBlock {
+                    cell_index: cell,
+                    bytes: superblock_bytes,
+                });
+            }
         }
     }
 
@@ -688,17 +709,21 @@ fn encode_one_page_v2(
     // --- Fill remaining cells with extra (cell1, cell2) copies -----
     // Alternating super-pair fillers. Either cell type is enough for
     // a v2 decoder to find SOMETHING valid in the trailing cells, so
-    // alternating gives both types redundancy.
-    let used_cells: std::collections::HashSet<u32> = placed.iter().map(|p| p.cell_index).collect();
-    let total_cells = nx * options.geometry.ny();
-    let mut filler_toggle = false;
-    for cell in 0..total_cells {
-        if !used_cells.contains(&cell) {
-            placed.push(PlacedBlock {
-                cell_index: cell,
-                bytes: if filler_toggle { cell2_bytes } else { cell1_bytes },
-            });
-            filler_toggle = !filler_toggle;
+    // alternating gives both types redundancy. Skipped when
+    // `pad_to_full_page = false` (compact rendering).
+    if options.pad_to_full_page {
+        let used_cells: std::collections::HashSet<u32> =
+            placed.iter().map(|p| p.cell_index).collect();
+        let total_cells = nx * options.geometry.ny();
+        let mut filler_toggle = false;
+        for cell in 0..total_cells {
+            if !used_cells.contains(&cell) {
+                placed.push(PlacedBlock {
+                    cell_index: cell,
+                    bytes: if filler_toggle { cell2_bytes } else { cell1_bytes },
+                });
+                filler_toggle = !filler_toggle;
+            }
         }
     }
 
@@ -873,6 +898,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let payload: Vec<u8> = (0..500u32).map(|i| (i * 37 + 5) as u8).collect();
         let pages = encode(&payload, &opts, &meta()).unwrap();
@@ -893,6 +919,7 @@ mod tests {
             redundancy: 5,
             compress: true,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         // Compressible payload — repeated lorem-ish text.
         let mut payload = Vec::new();
@@ -912,6 +939,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         // 4500-byte pagesize at this geometry — pick something past
         // pagesize to force multi-page handling.
@@ -932,6 +960,7 @@ mod tests {
                 redundancy: r,
                 compress: false,
                 black: BLACK_PAPER,
+                pad_to_full_page: false,
             };
             let pages = encode(&payload, &opts, &meta()).unwrap();
             let recovered = decode_pages(&pages, &geometry);
@@ -950,6 +979,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let pages = encode(b"", &opts, &meta()).unwrap();
         assert_eq!(pages.len(), 1);
@@ -1015,6 +1045,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let payload: Vec<u8> = (0..448u32).map(|i| (i as u8).wrapping_mul(7)).collect();
         assert_eq!(
@@ -1085,6 +1116,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let payload = b"the quick brown fox jumps over the lazy dog";
         let salt = [0x42u8; 32];
@@ -1106,6 +1138,7 @@ mod tests {
             redundancy: 5,
             compress: true,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let mut payload = Vec::new();
         for _ in 0..50 {
@@ -1128,6 +1161,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         // pagesize_v2 at this geometry: nstring=9 → 9*5*90 = 4050.
         // 10000-byte payload + 16-byte tag = 10016 bytes ciphertext.
@@ -1153,6 +1187,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let salt = [0x55u8; 32];
         let iv = [0x66u8; 12];
@@ -1175,6 +1210,7 @@ mod tests {
                 redundancy: r,
                 compress: false,
                 black: BLACK_PAPER,
+                pad_to_full_page: false,
             };
             let pages = encode_v2_with_kat(&payload, &opts, &meta(), b"pw", &salt, &iv).unwrap();
             let recovered = v2_decode(&pages, &geometry, b"pw");
@@ -1193,6 +1229,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let payload = b"determinism test bytes";
         let salt = [0x12u8; 32];
@@ -1218,6 +1255,7 @@ mod tests {
             redundancy: 5,
             compress: false,
             black: BLACK_PAPER,
+            pad_to_full_page: false,
         };
         let payload = b"iv smoke test";
         let salt = [0x12u8; 32];
