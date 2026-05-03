@@ -41,6 +41,7 @@ pub mod encoder;
 pub mod finder;
 pub mod format;
 pub mod page;
+pub mod threshold;
 
 pub use codec::{
     PageDecodeError, PageEncodeError, decode_pages, encode_pages,

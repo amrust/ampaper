@@ -57,13 +57,10 @@ const FINDER_DOTS: [[u8; FINDER_SIZE_DOTS as usize]; FINDER_SIZE_DOTS as usize] 
     [1, 1, 1, 1, 1, 1, 1],
 ];
 
-const THRESHOLD: u8 = 128;
-
 /// Run-length tolerance for the 1:1:3:1:1 detection, as a fraction
 /// of the estimated unit size. ±50% is a deliberately wide tolerance
 /// — it lets the detector survive mild ink bleed without false-
-/// positive on noise. Tighter tolerances become viable once the
-/// scan-side path adds adaptive thresholding.
+/// positive on noise.
 const RUN_TOLERANCE: f32 = 0.5;
 
 /// One detected finder.
@@ -159,14 +156,17 @@ struct Run {
     length: u32,
 }
 
-/// Collect the run-lengths along row `y` of the bitmap.
-fn row_runs(bitmap: &PageBitmap, y: u32) -> Vec<Run> {
+/// Collect the run-lengths along row `y` of the bitmap. `threshold`
+/// classifies each pixel: `< threshold = black`, `>= threshold =
+/// white`. Phase 2.5c plumbs an Otsu-derived threshold through here
+/// so finder detection works on faded / shifted-histogram input.
+fn row_runs(bitmap: &PageBitmap, y: u32, threshold: u8) -> Vec<Run> {
     let row_start = (y as usize) * (bitmap.width as usize);
     let mut runs = Vec::new();
-    let mut prev_black = bitmap.pixels[row_start] < THRESHOLD;
+    let mut prev_black = bitmap.pixels[row_start] < threshold;
     let mut run_start = 0u32;
     for x in 1..bitmap.width {
-        let is_black = bitmap.pixels[row_start + x as usize] < THRESHOLD;
+        let is_black = bitmap.pixels[row_start + x as usize] < threshold;
         if is_black != prev_black {
             runs.push(Run { is_black: prev_black, start: run_start, length: x - run_start });
             run_start = x;
@@ -182,13 +182,13 @@ fn row_runs(bitmap: &PageBitmap, y: u32) -> Vec<Run> {
 }
 
 /// Collect run-lengths along column `x`.
-fn column_runs(bitmap: &PageBitmap, x: u32) -> Vec<Run> {
+fn column_runs(bitmap: &PageBitmap, x: u32, threshold: u8) -> Vec<Run> {
     let stride = bitmap.width as usize;
     let mut runs = Vec::new();
-    let mut prev_black = bitmap.pixels[x as usize] < THRESHOLD;
+    let mut prev_black = bitmap.pixels[x as usize] < threshold;
     let mut run_start = 0u32;
     for y in 1..bitmap.height {
-        let is_black = bitmap.pixels[(y as usize) * stride + x as usize] < THRESHOLD;
+        let is_black = bitmap.pixels[(y as usize) * stride + x as usize] < threshold;
         if is_black != prev_black {
             runs.push(Run { is_black: prev_black, start: run_start, length: y - run_start });
             run_start = y;
@@ -262,10 +262,10 @@ fn first_finder_match(runs: &[Run]) -> Option<(f32, f32)> {
 /// the count is a confidence signal for distinguishing real
 /// finders (many supporting hits) from chance 1:1:3:1:1 collisions
 /// in random data cell content (typically 1-2 supporting hits).
-pub fn find_all_finders(bitmap: &PageBitmap) -> Vec<(FinderHit, u32)> {
+pub fn find_all_finders(bitmap: &PageBitmap, threshold: u8) -> Vec<(FinderHit, u32)> {
     let mut raw_hits = Vec::new();
     for y in 0..bitmap.height {
-        let runs = row_runs(bitmap, y);
+        let runs = row_runs(bitmap, y, threshold);
         for window in runs.windows(5) {
             let Some((row_center_x, row_unit)) = match_finder_runs(window) else {
                 continue;
@@ -274,7 +274,7 @@ pub fn find_all_finders(bitmap: &PageBitmap) -> Vec<(FinderHit, u32)> {
             if col_x >= bitmap.width {
                 continue;
             }
-            let col_runs = column_runs(bitmap, col_x);
+            let col_runs = column_runs(bitmap, col_x, threshold);
             for col_window in col_runs.windows(5) {
                 let Some((col_center_y, col_unit)) = match_finder_runs(col_window) else {
                     continue;
@@ -305,7 +305,7 @@ pub fn find_all_finders(bitmap: &PageBitmap) -> Vec<(FinderHit, u32)> {
 /// at low `pixels_per_dot` where the run-length detector alone
 /// produces enough false positives to fool the cluster-size
 /// ranking.
-fn template_match(bitmap: &PageBitmap, hit: FinderHit) -> u32 {
+fn template_match(bitmap: &PageBitmap, hit: FinderHit, threshold: u8) -> u32 {
     let mut matches = 0u32;
     for (r, row) in FINDER_DOTS.iter().enumerate() {
         for (c, &expected) in row.iter().enumerate() {
@@ -323,7 +323,7 @@ fn template_match(bitmap: &PageBitmap, hit: FinderHit) -> u32 {
                 continue;
             }
             let pixel = bitmap.pixels[(pyi as usize) * (bitmap.width as usize) + pxi as usize];
-            let actual_black = pixel < THRESHOLD;
+            let actual_black = pixel < threshold;
             let expected_black = expected == 1;
             if actual_black == expected_black {
                 matches += 1;
@@ -452,7 +452,12 @@ pub fn locate_finders(
         return Err(FinderError::BitmapTooSmall);
     }
 
-    let clusters = find_all_finders(bitmap);
+    // Phase 2.5c: Otsu threshold replaces the fixed-128 check
+    // from earlier slices. Computed once per bitmap, threaded
+    // through all detection helpers.
+    let threshold = crate::v3::threshold::otsu_threshold(&bitmap.pixels);
+
+    let clusters = find_all_finders(bitmap, threshold);
     if clusters.len() < 3 {
         return Err(FinderError::InsufficientFinders { found: clusters.len() });
     }
@@ -467,7 +472,7 @@ pub fn locate_finders(
     // chance hits typically score below 40.
     let mut scored: Vec<(FinderHit, u32)> = clusters
         .iter()
-        .map(|(hit, _)| (*hit, template_match(bitmap, *hit)))
+        .map(|(hit, _)| (*hit, template_match(bitmap, *hit, threshold)))
         .filter(|(_, score)| *score >= 40) // 40/49 ≈ 82%
         .collect();
     if scored.len() < 3 {
@@ -531,7 +536,7 @@ mod tests {
     #[test]
     fn detects_lone_finder_at_scale_1() {
         let bm = bitmap_with_one_finder(20, 20, 5, 5, 1);
-        let runs = row_runs(&bm, 5 + 3); // center row of the finder
+        let runs = row_runs(&bm, 5 + 3, 128); // center row of the finder
         let (cx, unit) = first_finder_match(&runs).expect("should match");
         // Center dot is at column 5+3 = 8 → pixel center 8.5 at
         // scale=1 (dot 8 occupies pixels 8..9, run is 3 dots wide
@@ -545,7 +550,7 @@ mod tests {
         let bm = bitmap_with_one_finder(20, 20, 3, 3, 4);
         // Finder occupies dots 3..10, scale 4 → pixels 12..40.
         // Center row: dot 3+3 = 6 → pixels 24..28. Use row 26.
-        let runs = row_runs(&bm, 26);
+        let runs = row_runs(&bm, 26, 128);
         let (cx, unit) = first_finder_match(&runs).expect("should match at scale 4");
         // Center dot 6 → pixel range 24..28, geometric center 26.
         assert!((cx - 26.0).abs() < 1.0, "center {cx} not near 26");

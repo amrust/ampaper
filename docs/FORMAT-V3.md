@@ -1,15 +1,17 @@
 # ampaper v3 — wire format spec
 
 **Status:** Phase 1 (bytes-level codec) + Phase 2 (cell layer) +
-Phase 2.5a (corner finder patterns, offset + scale-drift
-tolerance) + Phase 2.5b (rotation correction via affine transform
-from the three finder centers, ±~5-10° tolerance). Adaptive
-thresholding and real-scanner noise tolerance are deferred to
-Phase 2.5c. Phases 3+ (compression, encryption, density,
-modulation) are deferred to their respective milestones (see
-"Roadmap" below). The bytes-level, page-level, and Phase 2.5
-page-bitmap wire formats defined here are stable; later phases
-extend them without breaking them.
+Phase 2.5 complete (corner finder patterns, offset + scale-drift
+tolerance, rotation correction via affine transform, Otsu
+adaptive thresholding, 5-point sub-pixel sampling). The codec is
+now ready for real print-and-scan experiments — synthetic round-
+trip tests cover offset, rotation, paper fade, bilinear
+interpolation, and additive noise both individually and combined.
+Phases 3+ (compression, encryption, density, modulation) are
+deferred to their respective milestones (see "Roadmap" below).
+The bytes-level, page-level, and Phase 2.5 page-bitmap wire
+formats defined here are stable; later phases extend them without
+breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -60,7 +62,7 @@ v3 addresses all three:
 | 2.0    | Cell layout, page bitmap render/parse, anchor block | n/a (synthetic round-trip)      |
 | 2.5a   | QR-style corner finders + offset/scale-drift detection | n/a (still synthetic — but page can sit anywhere in a larger bitmap) |
 | 2.5b   | Rotation correction via affine transform from 3 finders + template-match filter | n/a (synthetic + rotated) |
-| 2.5c   | Adaptive thresholding + sub-pixel sampling        | 1.3-1.5×                          |
+| 2.5c   | Otsu adaptive thresholding + 5-point sub-pixel sampling | 1.3-1.5× (real scanner ready) |
 | 3      | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
 | 4      | High dot density (250-300 dot/in)                 | ~3×                               |
 | 5      | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
@@ -418,14 +420,94 @@ coordinates. Floor (not round) for the same reason as Phase 2.5a:
 at scale=1, every continuous coordinate is X.5 and round
 half-away-from-zero would tip every sample onto the next dot.
 
-### Phase 2.5c will add
+## Phase 2.5c: adaptive thresholding + sub-pixel sampling
 
-- **Adaptive thresholding.** Otsu or per-region thresholding
-  instead of fixed `< 128`. Real scanner output rarely has the
-  bimodal histogram synthetic bitmaps do.
-- **Sub-pixel sampling.** Integrate over each dot's pixel area
-  rather than sampling the geometric-center pixel. Suppresses
-  edge bleed where ink dots aren't perfect circles.
+This is the slice currently extending `src/v3/threshold.rs` (new),
+and updating `src/v3/finder.rs` and `src/v3/page.rs`. Drops the
+fixed `< 128` threshold + single-pixel center sampling that the
+earlier slices used, replacing them with Otsu's method (per-page
+adaptive threshold) and 5-point sub-pixel averaging. With these
+two upgrades the codec is finally robust enough for real-scanner
+output.
+
+### Otsu's method (`src/v3/threshold.rs`)
+
+Standard textbook Otsu (1979): pick the grayscale threshold that
+maximizes inter-class variance for the bitmap's pixel histogram.
+The same algorithm Tesseract, ZXing, and libdmtx use for
+document binarization.
+
+The function is called once per page bitmap from
+`finder::locate_finders` (for finder detection's run-length and
+template-match passes) AND from `page::parse_page` (for cell
+sampling). The threshold itself isn't transmitted in the wire
+format — it's recovered from the bitmap pixel histogram on every
+parse, so changes in the threshold-picking algorithm don't
+require a wire-format bump.
+
+Edge cases:
+- **All-same-value input** (e.g., all-white blank bitmap): no
+  bimodal split exists, all candidate thresholds produce zero
+  between-class variance. The function falls back to 128 — the
+  caller then sees "no black pixels found" and bails via the
+  existing finder-detection error path.
+- **Convention shift.** Standard Otsu picks `t` such that pixels
+  of value `<= t` are class 0 (black). The v3 parse path uses
+  `pixel < threshold` for "black" (the more natural way to spell
+  it in code). The implementation therefore returns `t + 1`
+  (saturating at 255) so a class-0 pixel of value `t` correctly
+  satisfies `t < t+1`.
+
+### 5-point sub-pixel sampling
+
+Each dot's pixel position in the bitmap is computed from the
+affine transform's projection of the dot's geometric center in
+page-dot space. Phase 2.5b sampled the single pixel at that
+position. Phase 2.5c samples FIVE positions in page-dot space:
+
+```
+   ·     ·
+      ·         ← 5 sample points: center plus 4 quarter-points
+   ·     ·       at ±0.25 from the dot's geometric center
+```
+
+Each of the 5 points gets transformed to pixel space via the
+affine, the bitmap pixel at the floor-integer coordinates is
+sampled, and the 5 values are averaged. The average is then
+compared against the Otsu threshold.
+
+For axis-aligned scale=1 input all 5 sample points truncate to
+the same pixel, so the behavior is identical to single-pixel
+sampling. For larger scale, the 5 points spread across roughly
+half the dot's pixel footprint, suppressing edge bleed and
+bilinear-interpolation artifacts that single-pixel sampling
+would catch in the wrong way.
+
+Out-of-bounds samples are skipped (not counted in the average).
+If all 5 are out of bounds, the parser returns
+`CellSamplingOutOfBounds` — indicates the geometry says the
+data grid extends past the bitmap edge, even though finders
+were found.
+
+### What this slice does NOT yet do
+
+- **Per-region thresholding.** Single global Otsu handles uniform
+  fade and uniform gamma drift across a page. A page with a
+  spotlight or coffee-stain shadow would defeat it. Sauvola or
+  per-tile Otsu would handle those, deferred until they become
+  necessary on a specific real-scan failure.
+- **Affine sampling kernel.** The 5 sample points spread evenly
+  in PAGE-DOT space; in pixel space (after the affine transform)
+  they become a parallelogram. For heavily-sheared input the
+  parallelogram could elongate, leaving sample points outside
+  the dot. Not a problem at the ±5-10° rotations Phase 2.5b
+  handles, but worth pinning if Phase 2.5d ever extends to
+  larger angles.
+- **Real print-and-scan validation.** All Phase 2.5c tests
+  synthesize the distortions in software. The next step is
+  actually printing a v3 page on paper, scanning it, and
+  confirming the synthetic-test combo of distortions reflects
+  reality.
 
 ## Channel asymmetry (Phase 6+ planning note)
 

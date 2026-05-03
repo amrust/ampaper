@@ -302,6 +302,152 @@ fn pages_decode_when_rotated_a_few_degrees() {
     }
 }
 
+/// Lighten every pixel by `fade_amount` (saturating at 255) to
+/// simulate paper fade or scanner gamma drift. Used by the Phase
+/// 2.5c Otsu test — if `fade_amount` exceeds 128, every "black"
+/// pixel value sits ABOVE the old fixed-128 threshold, and a
+/// non-adaptive threshold would silently lose all data.
+fn fade_pixels(bitmap: &PageBitmap, fade_amount: u8) -> PageBitmap {
+    let mut pixels = bitmap.pixels.clone();
+    for p in pixels.iter_mut() {
+        *p = p.saturating_add(fade_amount);
+    }
+    PageBitmap { pixels, width: bitmap.width, height: bitmap.height }
+}
+
+/// Bilinear rotation into a larger canvas. Unlike the
+/// nearest-neighbor rotate used by the Phase 2.5b tests, bilinear
+/// interpolation introduces gray pixels at black/white transitions
+/// — closer to how a real scanner's anti-aliased capture looks.
+/// Phase 2.5c's 5-point sub-pixel averaging is the load-bearing
+/// upgrade for handling this.
+fn rotate_bilinear_into_larger_canvas(src: &PageBitmap, angle_deg: f32) -> PageBitmap {
+    let theta = angle_deg.to_radians();
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    let w = src.width as f32;
+    let h = src.height as f32;
+    let new_w = (w * cos_t.abs() + h * sin_t.abs()).ceil() as u32 + 20;
+    let new_h = (w * sin_t.abs() + h * cos_t.abs()).ceil() as u32 + 20;
+    let mut pixels = vec![ampaper::v3::page::WHITE; (new_w * new_h) as usize];
+    let cx_old = w / 2.0;
+    let cy_old = h / 2.0;
+    let cx_new = new_w as f32 / 2.0;
+    let cy_new = new_h as f32 / 2.0;
+    for ny in 0..new_h {
+        for nx in 0..new_w {
+            let dx = nx as f32 - cx_new;
+            let dy = ny as f32 - cy_new;
+            let ox = cos_t * dx + sin_t * dy + cx_old;
+            let oy = -sin_t * dx + cos_t * dy + cy_old;
+            // Bilinear sample at (ox, oy) from src.
+            if ox < 0.0 || oy < 0.0 || ox >= w - 1.0 || oy >= h - 1.0 {
+                continue;
+            }
+            let x0 = ox as u32;
+            let y0 = oy as u32;
+            let fx = ox - x0 as f32;
+            let fy = oy - y0 as f32;
+            let stride = src.width as usize;
+            let p00 = src.pixels[(y0 as usize) * stride + x0 as usize] as f32;
+            let p10 = src.pixels[(y0 as usize) * stride + x0 as usize + 1] as f32;
+            let p01 = src.pixels[(y0 as usize + 1) * stride + x0 as usize] as f32;
+            let p11 = src.pixels[(y0 as usize + 1) * stride + x0 as usize + 1] as f32;
+            let blended = p00 * (1.0 - fx) * (1.0 - fy)
+                + p10 * fx * (1.0 - fy)
+                + p01 * (1.0 - fx) * fy
+                + p11 * fx * fy;
+            pixels[(ny * new_w + nx) as usize] = blended.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    PageBitmap { pixels, width: new_w, height: new_h }
+}
+
+/// Add deterministic pseudo-Gaussian noise with the given
+/// standard deviation (in pixel units) to every pixel. Uses a
+/// linear-congruential RNG seeded by pixel position so the test
+/// is bit-reproducible. Approximates Gaussian via the sum of two
+/// uniform draws (central limit theorem with N=2 is very rough,
+/// but adequate for "is the parse path noise-tolerant" testing).
+fn add_pseudo_noise(bitmap: &PageBitmap, std_dev: f32) -> PageBitmap {
+    let mut pixels = bitmap.pixels.clone();
+    let w = bitmap.width as usize;
+    for (i, p) in pixels.iter_mut().enumerate() {
+        // Deterministic per-position seed.
+        let seed = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(0xDEAD_BEEF);
+        let r1 = ((seed >> 16) & 0xFFFF) as f32 / 65536.0; // [0, 1)
+        let r2 = ((seed.wrapping_mul(48271)) >> 16 & 0xFFFF) as f32 / 65536.0;
+        // Two uniform draws, sum minus 1 → roughly mean=0, scaled to std_dev.
+        let n = (r1 + r2 - 1.0) * std_dev * 2.0;
+        let v = (*p as f32 + n).round().clamp(0.0, 255.0);
+        *p = v as u8;
+        let _ = w; // silence lint; w is unused but useful for later 2D-noise extensions
+    }
+    PageBitmap { pixels, width: bitmap.width, height: bitmap.height }
+}
+
+#[test]
+fn pages_decode_through_paper_fade() {
+    // Phase 2.5c Otsu test. Lighten every pixel by 100 — the old
+    // fixed-128 threshold would now treat (former-black) pixels
+    // of value 100 as "white" and lose all data. Otsu adapts to
+    // the shifted histogram and picks a threshold around 200.
+    let plaintext = b"Phase 2.5c handles paper fade via Otsu.".to_vec();
+    let geom = PageGeometry { nx: 4, ny: 4, pixels_per_dot: 4 };
+    let pages = encode_pages(&plaintext, &geom, 5).unwrap();
+    let faded: Vec<PageBitmap> = pages.iter().map(|p| fade_pixels(p, 100)).collect();
+    let recovered = decode_pages(&faded, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn pages_decode_through_bilinear_rotation() {
+    // Phase 2.5c sub-pixel sampling test. Bilinear rotation
+    // introduces gray pixels at every black/white transition;
+    // single-pixel sampling at the geometric center can land
+    // on one of those grays and read the wrong bit. The 5-point
+    // average over each dot's footprint smooths past these
+    // edge artefacts.
+    let plaintext = b"Phase 2.5c handles bilinear-interpolated rotation.".to_vec();
+    let geom = PageGeometry { nx: 4, ny: 4, pixels_per_dot: 6 };
+    let pages = encode_pages(&plaintext, &geom, 5).unwrap();
+    let rotated: Vec<PageBitmap> =
+        pages.iter().map(|p| rotate_bilinear_into_larger_canvas(p, 4.0)).collect();
+    let recovered = decode_pages(&rotated, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn pages_decode_through_combined_real_scanner_distortions() {
+    // The Phase 2.5c finale: combine all three distortions a
+    // real flatbed scanner introduces — paper fade (Otsu), small
+    // rotation with bilinear interpolation (sub-pixel sampling),
+    // and additive sensor noise (both helping). If this round-
+    // trips, the codec is finally ready for actual print + scan
+    // experiments. Up to this slice the parse path was synthetic-
+    // only; this test pins it as scanner-grade.
+    let plaintext: Vec<u8> = (0u32..1500)
+        .map(|i| (i.wrapping_mul(7).wrapping_add(11) & 0xFF) as u8)
+        .collect();
+    let geom = PageGeometry { nx: 5, ny: 5, pixels_per_dot: 6 };
+    let pages = encode_pages(&plaintext, &geom, 10).unwrap();
+
+    let processed: Vec<PageBitmap> = pages
+        .iter()
+        .map(|p| {
+            // 1. Bilinear rotation by 3°.
+            let rotated = rotate_bilinear_into_larger_canvas(p, 3.0);
+            // 2. Paper fade — lighten by 60.
+            let faded = fade_pixels(&rotated, 60);
+            // 3. Sensor noise with σ ≈ 12.
+            add_pseudo_noise(&faded, 12.0)
+        })
+        .collect();
+
+    let recovered = decode_pages(&processed, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
 #[test]
 fn pages_decode_when_rotated_and_offset() {
     // Combine Phase 2.5a (offset) and Phase 2.5b (rotation): pad

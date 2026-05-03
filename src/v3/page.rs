@@ -303,6 +303,42 @@ pub fn parse_page(
     let ty = tl.center_y - c * 3.5 - d * 3.5;
 
     // 4. Sample cells through the transform.
+    //
+    // Phase 2.5c: two upgrades over Phase 2.5b's single-pixel
+    // sample at the geometric center.
+    //   (a) Otsu-derived threshold instead of fixed 128 — handles
+    //       paper fade and scanner-gamma drift that push both ink
+    //       and paper pixel values onto the same side of 128.
+    //   (b) Five-point sub-pixel averaging — sample at the center
+    //       and the 4 quarter-points of each dot's unit square in
+    //       page-dot space, average the bitmap pixel values, and
+    //       compare the average to the threshold. Suppresses the
+    //       single-pixel-edge-case failure mode where a bilinear-
+    //       interpolated rotation puts a gray pixel exactly at
+    //       the dot's geometric center; the average over 5 spread
+    //       points stays on the correct side.
+    //
+    // For axis-aligned synthetic input both upgrades are no-ops:
+    // the bitmap is already bimodal (Otsu picks 128-ish), the
+    // dots are uniform pixel blocks (averaging gives the same
+    // value as single-point sampling). For real-scanner output
+    // both pull their weight.
+    let threshold = crate::v3::threshold::otsu_threshold(&bitmap.pixels);
+
+    // Sub-pixel sampling offsets in page-dot space. Center plus
+    // four quarter-points spread by ±0.25 from the center. After
+    // affine-transform projection these become 5 sample positions
+    // in pixel space spread roughly across half the dot's pixel
+    // footprint — enough to average over local noise without
+    // bleeding into adjacent dots.
+    const OFFSETS: [(f32, f32); 5] = [
+        (0.0, 0.0),
+        (-0.25, -0.25),
+        (0.25, -0.25),
+        (-0.25, 0.25),
+        (0.25, 0.25),
+    ];
+
     let cells_per_page = geometry.cells_per_page() as usize;
     let mut cells = Vec::with_capacity(cells_per_page);
     let bitmap_w = bitmap.width as usize;
@@ -316,29 +352,38 @@ pub fn parse_page(
         let mut cell = [0u8; CELL_BYTES];
         for inner_row in 0..CELL_DOTS as usize {
             for inner_col in 0..CELL_DOTS as usize {
-                // Sample at the dot's geometric center in page-dot
-                // space (the inner_col/inner_row + 0.5 offset).
-                // Project to pixel space via the affine transform.
-                let dot_x = cell_origin_dot_x + inner_col as f32 + 0.5;
-                let dot_y = cell_origin_dot_y + inner_row as f32 + 0.5;
-                let sx = a * dot_x + b * dot_y + tx;
-                let sy = c * dot_x + d * dot_y + ty;
-                // `f32 as i64` truncates toward zero (= floor for
-                // positive coordinates). Using `round` would tip
-                // onto the wrong dot at scale=1 (8.5 → 9 picks dot
-                // 9 instead of dot 8), pinned by the page round-
-                // trip test at scale=1 from Phase 2.5a.
-                let pxi = sx as i64;
-                let pyi = sy as i64;
-                if pxi < 0
-                    || pyi < 0
-                    || pxi >= bitmap.width as i64
-                    || pyi >= bitmap.height as i64
-                {
+                // Center of the dot in page-dot space.
+                let center_x = cell_origin_dot_x + inner_col as f32 + 0.5;
+                let center_y = cell_origin_dot_y + inner_row as f32 + 0.5;
+                // Average over 5 sub-pixel sample positions. Skip
+                // OOB samples; if all 5 are OOB, the geometry
+                // claims a cell that's not in the bitmap → error.
+                let mut sum = 0u32;
+                let mut count = 0u32;
+                for (ox, oy) in OFFSETS {
+                    let dx_dot = center_x + ox;
+                    let dy_dot = center_y + oy;
+                    let sx = a * dx_dot + b * dy_dot + tx;
+                    let sy = c * dx_dot + d * dy_dot + ty;
+                    // `f32 as i64` truncates toward zero (= floor
+                    // for positive coordinates). `round` would
+                    // tip onto the wrong dot at scale=1.
+                    let pxi = sx as i64;
+                    let pyi = sy as i64;
+                    if pxi >= 0
+                        && pyi >= 0
+                        && pxi < bitmap.width as i64
+                        && pyi < bitmap.height as i64
+                    {
+                        sum += bitmap.pixels[(pyi as usize) * bitmap_w + pxi as usize] as u32;
+                        count += 1;
+                    }
+                }
+                if count == 0 {
                     return Err(ParseError::CellSamplingOutOfBounds);
                 }
-                let pixel = bitmap.pixels[(pyi as usize) * bitmap_w + pxi as usize];
-                if pixel < 128 {
+                let avg = (sum / count) as u8;
+                if avg < threshold {
                     let bit_idx = inner_row * CELL_DOTS as usize + inner_col;
                     cell[bit_idx / 8] |= 1 << (7 - (bit_idx % 8));
                 }
