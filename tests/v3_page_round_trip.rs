@@ -230,6 +230,96 @@ fn pages_decode_with_modest_scale_drift() {
     assert_eq!(recovered, plaintext);
 }
 
+/// Rotate a bitmap by `angle_deg` clockwise into a larger
+/// canvas (with white margins) using nearest-neighbor sampling.
+/// Used by Phase 2.5b rotation tests — nearest-neighbor matches
+/// the high-contrast bimodal nature of v3 page bitmaps without
+/// introducing intermediate gray levels that the fixed-128
+/// threshold would have to cope with.
+fn rotate_into_larger_canvas(src: &PageBitmap, angle_deg: f32) -> PageBitmap {
+    let theta = angle_deg.to_radians();
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    // New canvas: enough margin that rotation doesn't clip the page.
+    // A square that fits the rotated rectangle has side = w·|cos| + h·|sin|.
+    let w = src.width as f32;
+    let h = src.height as f32;
+    let new_w = (w * cos_t.abs() + h * sin_t.abs()).ceil() as u32 + 20;
+    let new_h = (w * sin_t.abs() + h * cos_t.abs()).ceil() as u32 + 20;
+    let mut pixels = vec![ampaper::v3::page::WHITE; (new_w * new_h) as usize];
+    let cx_old = w / 2.0;
+    let cy_old = h / 2.0;
+    let cx_new = new_w as f32 / 2.0;
+    let cy_new = new_h as f32 / 2.0;
+    for ny in 0..new_h {
+        for nx in 0..new_w {
+            let dx = nx as f32 - cx_new;
+            let dy = ny as f32 - cy_new;
+            // Inverse rotation: rotate (dx, dy) by -theta to find source pixel.
+            let ox = cos_t * dx + sin_t * dy + cx_old;
+            let oy = -sin_t * dx + cos_t * dy + cy_old;
+            let oxi = ox as i64;
+            let oyi = oy as i64;
+            if oxi < 0 || oyi < 0 || oxi >= src.width as i64 || oyi >= src.height as i64 {
+                continue;
+            }
+            pixels[(ny * new_w + nx) as usize] =
+                src.pixels[(oyi as usize) * (src.width as usize) + oxi as usize];
+        }
+    }
+    PageBitmap { pixels, width: new_w, height: new_h }
+}
+
+#[test]
+fn pages_decode_when_rotated_a_few_degrees() {
+    // The Phase 2.5b unlock: pages tilted by a small angle (the
+    // typical condition of any flatbed scan that's not perfectly
+    // straight) still decode. The decoder uses the three corner
+    // finders to compute an affine transform from page-dot space
+    // to bitmap-pixel space, so rotation, modest skew, and scale
+    // drift all fall out of the same math.
+    let plaintext: Vec<u8> = (0u32..1500)
+        .map(|i| (i.wrapping_mul(11).wrapping_add(3) & 0xFF) as u8)
+        .collect();
+    // Use a generous pixels_per_dot so the rotation's
+    // nearest-neighbor sampling artefacts don't blur the dot
+    // pattern past the threshold detector. Real high-DPI scans
+    // give us this same property.
+    let geom = PageGeometry { nx: 5, ny: 5, pixels_per_dot: 6 };
+    let pages = encode_pages(&plaintext, &geom, 10).unwrap();
+
+    // Try a few small rotation angles. ±5° is the typical
+    // worst-case for a flatbed scan when the page isn't aligned.
+    for angle in [-5.0, -2.0, 1.5, 4.0] {
+        let rotated: Vec<PageBitmap> =
+            pages.iter().map(|p| rotate_into_larger_canvas(p, angle)).collect();
+        let recovered = decode_pages(&rotated, &geom)
+            .unwrap_or_else(|e| panic!("decode at {angle}° failed: {e}"));
+        assert_eq!(
+            recovered, plaintext,
+            "round-trip at {angle}° rotation must recover bytes exactly"
+        );
+    }
+}
+
+#[test]
+fn pages_decode_when_rotated_and_offset() {
+    // Combine Phase 2.5a (offset) and Phase 2.5b (rotation): pad
+    // the rendered page with asymmetric white margins, then
+    // rotate the whole thing. Both transforms should compose
+    // through the affine fit.
+    let plaintext = b"Phase 2.5b composes with Phase 2.5a's offset handling.".to_vec();
+    let geom = PageGeometry { nx: 4, ny: 4, pixels_per_dot: 5 };
+    let pages = encode_pages(&plaintext, &geom, 5).unwrap();
+    assert_eq!(pages.len(), 1);
+
+    let padded = pad_with_white(&pages[0], 30, 50, 70, 25);
+    let rotated = rotate_into_larger_canvas(&padded, 3.5);
+
+    let recovered = decode_pages(&[rotated], &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
 #[test]
 fn decoder_rejects_geometry_mismatch() {
     let plaintext = b"hello";

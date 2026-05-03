@@ -1,15 +1,15 @@
 # ampaper v3 — wire format spec
 
 **Status:** Phase 1 (bytes-level codec) + Phase 2 (cell layer) +
-Phase 2.5 first slice (QR-style corner finder patterns, finder-
-based grid registration with offset + scale-drift tolerance).
-Rotation handling, adaptive thresholding, and real-scanner
-noise tolerance are deferred to subsequent Phase 2.5 sub-slices.
-Phases 3+ (compression, encryption, density, modulation) are
-deferred to their respective milestones (see "Roadmap" below).
-The bytes-level, page-level, and Phase 2.5 page-bitmap wire
-formats defined here are stable; later phases extend them without
-breaking them.
+Phase 2.5a (corner finder patterns, offset + scale-drift
+tolerance) + Phase 2.5b (rotation correction via affine transform
+from the three finder centers, ±~5-10° tolerance). Adaptive
+thresholding and real-scanner noise tolerance are deferred to
+Phase 2.5c. Phases 3+ (compression, encryption, density,
+modulation) are deferred to their respective milestones (see
+"Roadmap" below). The bytes-level, page-level, and Phase 2.5
+page-bitmap wire formats defined here are stable; later phases
+extend them without breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -59,7 +59,7 @@ v3 addresses all three:
 | 1      | Bytes-level RaptorQ codec, magic + OTI header     | n/a (no bitmap layer yet)         |
 | 2.0    | Cell layout, page bitmap render/parse, anchor block | n/a (synthetic round-trip)      |
 | 2.5a   | QR-style corner finders + offset/scale-drift detection | n/a (still synthetic — but page can sit anywhere in a larger bitmap) |
-| 2.5b   | Rotation correction via affine transform from 3 finders | n/a                          |
+| 2.5b   | Rotation correction via affine transform from 3 finders + template-match filter | n/a (synthetic + rotated) |
 | 2.5c   | Adaptive thresholding + sub-pixel sampling        | 1.3-1.5×                          |
 | 3      | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
 | 4      | High dot density (250-300 dot/in)                 | ~3×                               |
@@ -326,12 +326,100 @@ which is what the detector keys on. Same shape as a QR finder.
   fourth corner for "no finder" gives Phase 2.5b a free
   orientation signal without a wire-format bump.
 
-### Phase 2.5b/c will add
+## Phase 2.5b: rotation correction via affine transform
 
-- **Rotation handling.** Use the three finder centers' relative
-  positions to compute an affine (or homography) transform from
-  page-dot space to bitmap-pixel space. Replaces the current
-  axis-aligned assumption.
+This is the slice currently extending `src/v3/finder.rs` and
+`src/v3/page.rs`. Drops Phase 2.5a's "axis-aligned only"
+assumption — the parser now solves a 2D affine transform from the
+three known finder positions, so rotation, modest skew, and
+already-handled scale drift fall out of the same math. Tolerates
+roughly ±5–10° rotation, depending on the printer-pixel scale
+(higher scale → more tolerance).
+
+### Detection upgrade
+
+The Phase 2.5a detector raster-scanned for the FIRST 1:1:3:1:1 hit
+and assumed it was the top-left finder, then expected-position-
+searched for top-right and bottom-left. That works at 0° rotation
+but breaks as soon as the page is tilted: the "first hit" is no
+longer reliably the top-left finder, and the expected positions
+are no longer where the other finders actually are.
+
+Phase 2.5b replaces it with an all-finders-then-identify approach:
+
+1. **`find_all_finders`** scans every row + every matching column
+   for 1:1:3:1:1 hits, then greedily clusters hits within
+   `3 · unit` pixels into one representative per finder.
+   Cluster hit count is the first-pass confidence signal.
+2. **Template match filter.** Each cluster gets sampled against
+   the actual 7×7 dot pattern at its center (using the cluster's
+   estimated `unit` for the per-dot scale). Real finders score
+   47–49 / 49; chance 1:1:3:1:1 collisions in random data cells
+   typically score below 40. The filter cutoff is 40 (≈82%).
+3. **Pick top 3 by template score**, sort the survivors by
+   cluster-hit count for tie-breaking.
+4. **`identify_corners`** runs the L-shape + cross-product
+   analysis: the vertex opposite the longest pairwise side is
+   TL; cross product of (TL→p1) × (TL→p2) is positive when
+   (p1, p2) is in the order (TR, BL).
+5. **Proportion sanity check.** The dot-distance ratio
+   `dist(TL, TR) / dist(TL, BL)` should approximate the page's
+   `(W − 7) / (H − 7)`, regardless of rotation. ±30% tolerance.
+
+The template match filter is the load-bearing change for
+robustness at low `pixels_per_dot`. At scale=1 each real finder
+contributes only ~3 cluster hits, which is too small a margin
+above chance hits for cluster count alone to rank reliably.
+Sampling the 7×7 area against the known `FINDER_DOTS` template
+is a much sharper filter — caught the regression where Phase
+2.5b's all-finders detector failed `round_trips_one_megabyte`
+because false positives in random multi-page data fooled the
+top-3-by-count selection.
+
+### Affine transform
+
+Given three known finder centers in page-dot space:
+
+```
+TL_dot = (3.5, 3.5)
+TR_dot = (page_width_dots − 3.5, 3.5)
+BL_dot = (3.5, page_height_dots − 3.5)
+```
+
+and three measured pixel positions `(TL.x, TL.y)`, `(TR.x, TR.y)`,
+`(BL.x, BL.y)`, the parser solves for `a, b, c, d, tx, ty` in:
+
+```
+pixel_x = a · page_x + b · page_y + tx
+pixel_y = c · page_x + d · page_y + ty
+```
+
+Six unknowns, six equations. Closed-form solution:
+
+```
+a  = (TR.x − TL.x) / (W − 7)
+b  = (BL.x − TL.x) / (H − 7)
+c  = (TR.y − TL.y) / (W − 7)
+d  = (BL.y − TL.y) / (H − 7)
+tx = TL.x − a · 3.5 − b · 3.5
+ty = TL.y − c · 3.5 − d · 3.5
+```
+
+For axis-aligned input, `b = c = 0` and `a = d = pixels_per_dot`,
+so the transform reduces to the simpler grid-origin math from
+Phase 2.5a. For rotated input, `b` and `c` carry the rotation;
+modest skew (where `a ≠ d` or the off-diagonals don't match) is
+also handled implicitly.
+
+Cell sampling projects each dot's geometric center
+(`(cell_origin + col + 0.5, cell_origin + row + 0.5)` in page-dot
+space) through the transform, then floors to integer pixel
+coordinates. Floor (not round) for the same reason as Phase 2.5a:
+at scale=1, every continuous coordinate is X.5 and round
+half-away-from-zero would tip every sample onto the next dot.
+
+### Phase 2.5c will add
+
 - **Adaptive thresholding.** Otsu or per-region thresholding
   instead of fixed `< 128`. Real scanner output rarely has the
   bimodal histogram synthetic bitmaps do.

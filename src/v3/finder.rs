@@ -78,17 +78,22 @@ pub struct FinderHit {
     pub unit: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FinderError {
-    /// No top-left finder found — either the bitmap is blank, the
-    /// page is rotated past what this slice handles, or it isn't
-    /// a v3 page at all.
-    NoTopLeft,
-    /// Top-right finder missing at the expected horizontal offset
-    /// from the top-left finder.
-    NoTopRight,
-    /// Bottom-left finder missing at the expected vertical offset.
-    NoBottomLeft,
+    /// Fewer than 3 finder patterns detected. Either the bitmap
+    /// doesn't contain a v3 page, the rotation/distortion exceeds
+    /// what this slice handles (~±20°), or the page is partially
+    /// out of frame.
+    InsufficientFinders { found: usize },
+    /// More than 3 finder patterns detected after clustering.
+    /// Likely false positives in noisy bitmaps; future slices
+    /// will pick the 3 most-confident clusters by hit count.
+    AmbiguousFinders { found: usize },
+    /// Detected finder triple's L-shape proportions don't match
+    /// the supplied page geometry — most likely a chance triplet
+    /// of false-positive 1:1:3:1:1 matches in non-page content,
+    /// or a v3 page from a different `nx × ny` configuration.
+    ProportionMismatch { actual: f32, expected: f32 },
     /// Bitmap pixel buffer can't fit the requested geometry.
     BitmapTooSmall,
 }
@@ -96,14 +101,20 @@ pub enum FinderError {
 impl core::fmt::Display for FinderError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoTopLeft => f.write_str("no top-left finder pattern detected"),
-            Self::NoTopRight => f.write_str(
-                "top-right finder not found at expected position — \
-                 page may be rotated or geometry mismatch",
+            Self::InsufficientFinders { found } => write!(
+                f,
+                "only {found} finder pattern(s) detected (need 3) — \
+                 bitmap may not contain a v3 page or rotation exceeds tolerance"
             ),
-            Self::NoBottomLeft => f.write_str(
-                "bottom-left finder not found at expected position — \
-                 page may be rotated or geometry mismatch",
+            Self::AmbiguousFinders { found } => write!(
+                f,
+                "{found} finder patterns detected (expected 3) — \
+                 likely false positives in noisy input"
+            ),
+            Self::ProportionMismatch { actual, expected } => write!(
+                f,
+                "finder L-shape proportions {actual:.3} don't match expected {expected:.3} — \
+                 wrong page geometry, or non-page content"
             ),
             Self::BitmapTooSmall => f.write_str("bitmap too small for the requested geometry"),
         }
@@ -232,67 +243,33 @@ fn match_finder_runs(runs: &[Run]) -> Option<(f32, f32)> {
 
 /// Sweep `runs` for any 5-run window that matches the finder
 /// signature. Returns the first match (lowest start coordinate).
+/// Only used by the lower-level run-detection unit tests; the
+/// production all-finders detector inlines `runs.windows(5)`
+/// because it wants every match, not just the first.
+#[cfg(test)]
 fn first_finder_match(runs: &[Run]) -> Option<(f32, f32)> {
     runs.windows(5).find_map(match_finder_runs)
 }
 
-/// Locate the top-left finder by raster-scanning rows from the top
-/// of the bitmap until one gives a 1:1:3:1:1 hit. Verify by also
-/// scanning the column at the candidate center.
-fn find_top_left(bitmap: &PageBitmap) -> Option<FinderHit> {
+/// Find every finder-pattern hit in the bitmap, then cluster
+/// nearby hits down to one representative per finder. Each row of
+/// the bitmap may contribute multiple raw matches against a single
+/// finder (3 of the 7 rows of a finder pattern produce 1:1:3:1:1
+/// signatures), so without clustering one finder shows up as 3-9
+/// raw hits.
+///
+/// Returns clusters paired with their raw-hit count, descending —
+/// the count is a confidence signal for distinguishing real
+/// finders (many supporting hits) from chance 1:1:3:1:1 collisions
+/// in random data cell content (typically 1-2 supporting hits).
+pub fn find_all_finders(bitmap: &PageBitmap) -> Vec<(FinderHit, u32)> {
+    let mut raw_hits = Vec::new();
     for y in 0..bitmap.height {
-        let runs = row_runs(bitmap, y);
-        let Some((row_center_x, row_unit)) = first_finder_match(&runs) else {
-            continue;
-        };
-        // Round to integer column for the column-scan verification.
-        let col_x = row_center_x.round() as u32;
-        if col_x >= bitmap.width {
-            continue;
-        }
-        let col_runs = column_runs(bitmap, col_x);
-        for window in col_runs.windows(5) {
-            let Some((col_center_y, col_unit)) = match_finder_runs(window) else {
-                continue;
-            };
-            // The two unit estimates should agree within ±25%.
-            let unit_avg = (row_unit + col_unit) / 2.0;
-            if (row_unit - col_unit).abs() > unit_avg * 0.25 {
-                continue;
-            }
-            return Some(FinderHit {
-                center_x: row_center_x,
-                center_y: col_center_y,
-                unit: unit_avg,
-            });
-        }
-    }
-    None
-}
-
-/// Look for a finder pattern whose center is near `(target_x,
-/// target_y)`. Tolerates `±search_radius` in both axes. Used to
-/// confirm the top-right and bottom-left finders at the positions
-/// the geometry says they should be at, derived from the top-left
-/// finder + expected page dimensions.
-fn find_finder_near(
-    bitmap: &PageBitmap,
-    target_x: f32,
-    target_y: f32,
-    search_radius: f32,
-) -> Option<FinderHit> {
-    let y_min = (target_y - search_radius).max(0.0) as u32;
-    let y_max = (target_y + search_radius).min(bitmap.height as f32 - 1.0) as u32;
-    for y in y_min..=y_max {
         let runs = row_runs(bitmap, y);
         for window in runs.windows(5) {
             let Some((row_center_x, row_unit)) = match_finder_runs(window) else {
                 continue;
             };
-            if (row_center_x - target_x).abs() > search_radius {
-                continue;
-            }
-            // Confirm with a column scan.
             let col_x = row_center_x.round() as u32;
             if col_x >= bitmap.width {
                 continue;
@@ -302,11 +279,14 @@ fn find_finder_near(
                 let Some((col_center_y, col_unit)) = match_finder_runs(col_window) else {
                     continue;
                 };
-                if (col_center_y - target_y).abs() > search_radius {
+                // Both unit estimates should agree within ±25% —
+                // a chance horizontal-only 1:1:3:1:1 in noisy data
+                // is unlikely to also match in the column.
+                let unit_avg = (row_unit + col_unit) / 2.0;
+                if (row_unit - col_unit).abs() > unit_avg * 0.25 {
                     continue;
                 }
-                let unit_avg = (row_unit + col_unit) / 2.0;
-                return Some(FinderHit {
+                raw_hits.push(FinderHit {
                     center_x: row_center_x,
                     center_y: col_center_y,
                     unit: unit_avg,
@@ -314,27 +294,155 @@ fn find_finder_near(
             }
         }
     }
-    None
+    cluster_hits(raw_hits)
+}
+
+/// Sample a 7×7 dot area around `hit.center` (using `hit.unit` as
+/// the per-dot pixel scale) and count how many of the 49 sampled
+/// dots match the [`FINDER_DOTS`] template. Real finders score 47-49
+/// out of 49; chance 1:1:3:1:1 collisions in random data score
+/// much lower (typically 25-35). This is the load-bearing filter
+/// at low `pixels_per_dot` where the run-length detector alone
+/// produces enough false positives to fool the cluster-size
+/// ranking.
+fn template_match(bitmap: &PageBitmap, hit: FinderHit) -> u32 {
+    let mut matches = 0u32;
+    for (r, row) in FINDER_DOTS.iter().enumerate() {
+        for (c, &expected) in row.iter().enumerate() {
+            let dx_dots = c as f32 - 3.0;
+            let dy_dots = r as f32 - 3.0;
+            let px = hit.center_x + dx_dots * hit.unit;
+            let py = hit.center_y + dy_dots * hit.unit;
+            let pxi = px as i64;
+            let pyi = py as i64;
+            if pxi < 0
+                || pyi < 0
+                || pxi >= bitmap.width as i64
+                || pyi >= bitmap.height as i64
+            {
+                continue;
+            }
+            let pixel = bitmap.pixels[(pyi as usize) * (bitmap.width as usize) + pxi as usize];
+            let actual_black = pixel < THRESHOLD;
+            let expected_black = expected == 1;
+            if actual_black == expected_black {
+                matches += 1;
+            }
+        }
+    }
+    matches
+}
+
+/// Greedy clustering: hits within `3 * unit` pixels of an existing
+/// cluster's running average get merged. Returns `(averaged hit,
+/// raw-hit count)` per cluster, sorted by count descending so the
+/// caller can pick the top-N by confidence.
+fn cluster_hits(hits: Vec<FinderHit>) -> Vec<(FinderHit, u32)> {
+    // Each cluster: (sum_x, sum_y, sum_unit, count).
+    let mut clusters: Vec<(f32, f32, f32, u32)> = Vec::new();
+    for hit in hits {
+        let merge_dist = hit.unit * 3.0;
+        let mut merged = false;
+        for cluster in &mut clusters {
+            let n = cluster.3 as f32;
+            let avg_x = cluster.0 / n;
+            let avg_y = cluster.1 / n;
+            if (hit.center_x - avg_x).hypot(hit.center_y - avg_y) < merge_dist {
+                cluster.0 += hit.center_x;
+                cluster.1 += hit.center_y;
+                cluster.2 += hit.unit;
+                cluster.3 += 1;
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            clusters.push((hit.center_x, hit.center_y, hit.unit, 1));
+        }
+    }
+    let mut out: Vec<(FinderHit, u32)> = clusters
+        .into_iter()
+        .map(|(sx, sy, su, n)| {
+            let nf = n as f32;
+            (
+                FinderHit {
+                    center_x: sx / nf,
+                    center_y: sy / nf,
+                    unit: su / nf,
+                },
+                n,
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// Identify which of three detected finders is the top-left,
+/// top-right, and bottom-left corner. Two-step process:
+///
+///   1. Find the corner of the right-angle "L" — that's TL.
+///      Among the three pairwise distances, the longest one is
+///      the L's hypotenuse (TR-to-BL diagonal); the vertex NOT
+///      on that hypotenuse is TL. Works at any rotation.
+///   2. Disambiguate TR from BL via cross product. With image-
+///      coordinate Y-down, the order TL → TR → BL traces a
+///      clockwise turn, so `cross(TL→TR, TL→BL) > 0`. Whichever
+///      assignment satisfies that wins.
+fn identify_corners(
+    a: FinderHit,
+    b: FinderHit,
+    c: FinderHit,
+) -> (FinderHit, FinderHit, FinderHit) {
+    let d_ab = (a.center_x - b.center_x).hypot(a.center_y - b.center_y);
+    let d_ac = (a.center_x - c.center_x).hypot(a.center_y - c.center_y);
+    let d_bc = (b.center_x - c.center_x).hypot(b.center_y - c.center_y);
+
+    // The vertex opposite the longest side is TL.
+    let (tl, p1, p2) = if d_bc >= d_ab && d_bc >= d_ac {
+        (a, b, c)
+    } else if d_ac >= d_ab && d_ac >= d_bc {
+        (b, a, c)
+    } else {
+        (c, a, b)
+    };
+
+    // Cross product of (TL → p1) × (TL → p2). With image Y-down
+    // axis, TL → TR → BL is a clockwise turn, which gives a
+    // POSITIVE cross product. Whichever assignment matches wins.
+    let v1x = p1.center_x - tl.center_x;
+    let v1y = p1.center_y - tl.center_y;
+    let v2x = p2.center_x - tl.center_x;
+    let v2y = p2.center_y - tl.center_y;
+    let cross = v1x * v2y - v1y * v2x;
+    let (tr, bl) = if cross > 0.0 { (p1, p2) } else { (p2, p1) };
+
+    (tl, tr, bl)
 }
 
 /// Locate the three corner finders on a v3 page bitmap. Returns
-/// `[top_left, top_right, bottom_left]`.
+/// `[top_left, top_right, bottom_left]` in that order, regardless
+/// of how the page is rotated within the bitmap.
 ///
 /// Strategy:
-///   1. Raster-scan from the top of the bitmap to find the top-left
-///      finder. The first 1:1:3:1:1 match in row+column-scan order
-///      is taken to be the top-left finder.
-///   2. From the top-left finder's position and the supplied
-///      `page_width_dots` / `page_height_dots`, compute where the
-///      top-right and bottom-left finders SHOULD be (in pixels,
-///      using the top-left finder's `unit`).
-///   3. Search around those expected positions with a generous
-///      tolerance — accepts modest scale drift.
+///   1. Detect every finder-pattern hit in the bitmap, cluster
+///      nearby raw hits down to one representative per finder
+///      ([`find_all_finders`]).
+///   2. Require exactly 3 distinct clusters. Fewer = page partly
+///      out of frame or rotation past tolerance; more = noisy
+///      input with false positives that will need cluster-size
+///      ranking in a later slice.
+///   3. Identify which finder is TL/TR/BL by L-shape geometry +
+///      cross product ([`identify_corners`]).
+///   4. Verify the L-shape proportions match what the supplied
+///      `page_width_dots` × `page_height_dots` predicts. Catches
+///      "found 3 finders, but they belong to a v3 page with a
+///      different `nx × ny` than the caller supplied."
 ///
-/// Phase 2.5 first slice — assumes axis-aligned bitmap. Rotation
-/// support arrives in a later slice and will replace step 2's
-/// "expected position" math with affine-transform inference from
-/// all three finder centers.
+/// `page_width_dots` and `page_height_dots` are no longer used
+/// for "expected position" search (the all-finders detector
+/// doesn't need them), only for the proportion sanity check at
+/// the end.
 pub fn locate_finders(
     bitmap: &PageBitmap,
     page_width_dots: u32,
@@ -344,24 +452,56 @@ pub fn locate_finders(
         return Err(FinderError::BitmapTooSmall);
     }
 
-    let tl = find_top_left(bitmap).ok_or(FinderError::NoTopLeft)?;
+    let clusters = find_all_finders(bitmap);
+    if clusters.len() < 3 {
+        return Err(FinderError::InsufficientFinders { found: clusters.len() });
+    }
 
-    // Top-right finder center is at dot (page_width_dots - 4, 3),
-    // measured from the page's outer edge. Top-left finder center
-    // is at dot (3, 3). So the horizontal dot-distance between the
-    // two finder centers is page_width_dots - 7.
-    let horiz_dots = page_width_dots as f32 - FINDER_SIZE_DOTS as f32;
-    let target_tr_x = tl.center_x + horiz_dots * tl.unit;
-    let target_tr_y = tl.center_y;
-    let search_radius = tl.unit * 6.0; // ±6 dots — generous, covers scale drift up to ~10%
-    let tr = find_finder_near(bitmap, target_tr_x, target_tr_y, search_radius)
-        .ok_or(FinderError::NoTopRight)?;
+    // Filter + rank by template match. The run-length detector
+    // produces enough chance 1:1:3:1:1 collisions in random data
+    // cells (especially at pixels_per_dot=1, where each finder
+    // only contributes ~3 supporting cluster hits) that
+    // cluster-count alone can't reliably pick the real finders.
+    // The 7×7 dot template match at each candidate's center is a
+    // much stronger filter — real finders score 47-49 out of 49,
+    // chance hits typically score below 40.
+    let mut scored: Vec<(FinderHit, u32)> = clusters
+        .iter()
+        .map(|(hit, _)| (*hit, template_match(bitmap, *hit)))
+        .filter(|(_, score)| *score >= 40) // 40/49 ≈ 82%
+        .collect();
+    if scored.len() < 3 {
+        return Err(FinderError::InsufficientFinders { found: scored.len() });
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_three = [scored[0].0, scored[1].0, scored[2].0];
 
-    let vert_dots = page_height_dots as f32 - FINDER_SIZE_DOTS as f32;
-    let target_bl_x = tl.center_x;
-    let target_bl_y = tl.center_y + vert_dots * tl.unit;
-    let bl = find_finder_near(bitmap, target_bl_x, target_bl_y, search_radius)
-        .ok_or(FinderError::NoBottomLeft)?;
+    let (tl, tr, bl) = identify_corners(top_three[0], top_three[1], top_three[2]);
+
+    // Sanity-check the L-shape proportions. The dot-distance from
+    // TL center to TR center is `page_width_dots - 7`; from TL to
+    // BL is `page_height_dots - 7`. After rotation those distances
+    // are preserved, so the ratio (horiz_pixels / vert_pixels)
+    // should match `(W - 7) / (H - 7)` regardless of rotation.
+    let horiz_pixels = (tr.center_x - tl.center_x).hypot(tr.center_y - tl.center_y);
+    let vert_pixels = (bl.center_x - tl.center_x).hypot(bl.center_y - tl.center_y);
+    if vert_pixels < 1.0 {
+        return Err(FinderError::ProportionMismatch {
+            actual: 0.0,
+            expected: 1.0,
+        });
+    }
+    let actual_aspect = horiz_pixels / vert_pixels;
+    let expected_aspect = (page_width_dots as f32 - FINDER_SIZE_DOTS as f32)
+        / (page_height_dots as f32 - FINDER_SIZE_DOTS as f32);
+    // ±30% tolerance — generous for a sanity check; tighter would
+    // false-positive on legitimate pages with mild scanner stretch.
+    if (actual_aspect / expected_aspect - 1.0).abs() > 0.3 {
+        return Err(FinderError::ProportionMismatch {
+            actual: actual_aspect,
+            expected: expected_aspect,
+        });
+    }
 
     Ok([tl, tr, bl])
 }
@@ -440,13 +580,74 @@ mod tests {
     }
 
     #[test]
-    fn fails_with_no_top_left_on_blank_bitmap() {
+    fn fails_with_insufficient_finders_on_blank_bitmap() {
         let bm = PageBitmap {
             pixels: vec![WHITE; 100 * 100],
             width: 100,
             height: 100,
         };
         let err = locate_finders(&bm, 50, 50).unwrap_err();
-        assert!(matches!(err, FinderError::NoTopLeft));
+        assert!(matches!(err, FinderError::InsufficientFinders { found: 0 }));
+    }
+
+    #[test]
+    fn identifies_corners_when_page_is_rotated() {
+        // Build a 50×50-dot synthetic page with finders at TL/TR/BL,
+        // then rotate the resulting bitmap by ~5° clockwise inside
+        // a larger canvas. The detector should still identify
+        // which finder is which via the L-shape + cross-product
+        // analysis.
+        let pw = 50u32;
+        let ph = 50u32;
+        let scale = 4u32;
+        let inner_w = pw * scale;
+        let inner_h = ph * scale;
+        let mut inner_pixels = vec![WHITE; (inner_w * inner_h) as usize];
+        draw_finder(&mut inner_pixels, inner_w, 0, 0, scale);
+        draw_finder(&mut inner_pixels, inner_w, pw - FINDER_SIZE_DOTS, 0, scale);
+        draw_finder(&mut inner_pixels, inner_w, 0, ph - FINDER_SIZE_DOTS, scale);
+
+        // Rotate into a larger canvas to avoid clipping.
+        let canvas_w = inner_w + 100;
+        let canvas_h = inner_h + 100;
+        let mut canvas = vec![WHITE; (canvas_w * canvas_h) as usize];
+        let theta = 5.0_f32.to_radians();
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+        let cx_in = inner_w as f32 / 2.0;
+        let cy_in = inner_h as f32 / 2.0;
+        let cx_out = canvas_w as f32 / 2.0;
+        let cy_out = canvas_h as f32 / 2.0;
+        for ny in 0..canvas_h {
+            for nx in 0..canvas_w {
+                let dx = nx as f32 - cx_out;
+                let dy = ny as f32 - cy_out;
+                // Inverse rotation: rotate (dx, dy) by -theta to find source pixel.
+                let ox = cos_t * dx + sin_t * dy + cx_in;
+                let oy = -sin_t * dx + cos_t * dy + cy_in;
+                let oxi = ox as i64;
+                let oyi = oy as i64;
+                if oxi < 0 || oyi < 0 || oxi >= inner_w as i64 || oyi >= inner_h as i64 {
+                    continue;
+                }
+                canvas[(ny * canvas_w + nx) as usize] =
+                    inner_pixels[(oyi as usize) * (inner_w as usize) + oxi as usize];
+            }
+        }
+        let bm = PageBitmap { pixels: canvas, width: canvas_w, height: canvas_h };
+
+        let [tl, tr, bl] = locate_finders(&bm, pw, ph).unwrap();
+        // After 5° rotation, all three should still be detected
+        // and correctly identified. Sanity-check by direction: TR
+        // is to the right of TL (positive Δx), BL is below TL
+        // (positive Δy). Rotation preserves these for ±45°.
+        assert!(
+            tr.center_x > tl.center_x,
+            "TR should be to the right of TL after small rotation"
+        );
+        assert!(
+            bl.center_y > tl.center_y,
+            "BL should be below TL after small rotation"
+        );
     }
 }

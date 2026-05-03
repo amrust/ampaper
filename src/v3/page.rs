@@ -114,7 +114,7 @@ pub struct PageBitmap {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ParseError {
     /// Bitmap pixel buffer is shorter than `width × height` bytes.
     BitmapTruncated { expected: usize, got: usize },
@@ -260,61 +260,74 @@ pub fn parse_page(
         });
     }
 
-    // 1+2. Locate the three corner finders.
+    // 1+2. Locate the three corner finders. After Phase 2.5b, the
+    // detector returns them already identified (TL, TR, BL) and
+    // tolerates rotation up to about ±20°.
     let [tl, tr, bl] = locate_finders(
         bitmap,
         geometry.page_width_dots(),
         geometry.page_height_dots(),
     )?;
 
-    // 3. Measured per-dot pixel size, in each axis. Use both axes
-    // for robustness; the dx/dy split also makes future non-square
-    // pixel ratios cheaper to add.
-    let center_dots_horiz = (geometry.page_width_dots() - FINDER_SIZE_DOTS) as f32;
-    let center_dots_vert = (geometry.page_height_dots() - FINDER_SIZE_DOTS) as f32;
-    let dx = (tr.center_x - tl.center_x) / center_dots_horiz;
-    let dy = (bl.center_y - tl.center_y) / center_dots_vert;
-    if dx <= 0.0 || dy <= 0.0 {
-        return Err(ParseError::FinderDetection(FinderError::NoTopRight));
+    // 3. Solve for an affine transform mapping page-dot space to
+    // bitmap-pixel space:
+    //
+    //     pixel_x = a · page_x + b · page_y + tx
+    //     pixel_y = c · page_x + d · page_y + ty
+    //
+    // Three known points (TL, TR, BL) give six equations for six
+    // unknowns. The finder centers in page-dot space are at
+    // (3.5, 3.5), (page_w - 3.5, 3.5), (3.5, page_h - 3.5) — the
+    // half-dot offsets are because the finder's central dot is at
+    // index (3, 3) and its geometric center is at (3.5, 3.5).
+    //
+    // Subtracting the TL equation from the TR equation eliminates
+    // both b and tx in the x-component, giving
+    //   TR.x - TL.x = a · (page_w - 7)        ⇒ a = ΔX_TR / (W - 7)
+    // Similarly TR.y - TL.y = c · (W - 7), BL.x - TL.x = b · (H - 7),
+    // BL.y - TL.y = d · (H - 7), and tx, ty fall out from TL.
+    //
+    // For axis-aligned input b = 0, c = 0, a = d = pixels_per_dot,
+    // and the transform reduces to Phase 2.5a's grid-origin math.
+    // For rotated input, b and c carry the rotation/skew.
+    let pw_minus_7 = geometry.page_width_dots() as f32 - FINDER_SIZE_DOTS as f32;
+    let ph_minus_7 = geometry.page_height_dots() as f32 - FINDER_SIZE_DOTS as f32;
+    if pw_minus_7 <= 0.0 || ph_minus_7 <= 0.0 {
+        return Err(ParseError::CellSamplingOutOfBounds);
     }
+    let a = (tr.center_x - tl.center_x) / pw_minus_7;
+    let b = (bl.center_x - tl.center_x) / ph_minus_7;
+    let c = (tr.center_y - tl.center_y) / pw_minus_7;
+    let d = (bl.center_y - tl.center_y) / ph_minus_7;
+    let tx = tl.center_x - a * 3.5 - b * 3.5;
+    let ty = tl.center_y - c * 3.5 - d * 3.5;
 
-    // The finder's central dot sits at page-dot (3, 3) — so its
-    // GEOMETRIC center is at page-dot (3.5, 3.5) in continuous
-    // coordinates. The data-grid origin (top-left corner of dot
-    // FINDER_MARGIN_DOTS) is therefore offset by
-    // (FINDER_MARGIN_DOTS - 3.5) dots from the detected finder
-    // center. Off-by-half here costs a half-dot per cell at every
-    // scale > 1 — caught by the page round-trip tests when we
-    // first wrote this slice.
-    let center_offset_dots = FINDER_MARGIN_DOTS as f32 - 3.5;
-    let grid_origin_x = tl.center_x + center_offset_dots * dx;
-    let grid_origin_y = tl.center_y + center_offset_dots * dy;
-
-    // 4. Sample cells.
+    // 4. Sample cells through the transform.
     let cells_per_page = geometry.cells_per_page() as usize;
     let mut cells = Vec::with_capacity(cells_per_page);
     let bitmap_w = bitmap.width as usize;
     for idx in 0..cells_per_page {
         let cell_col = (idx % geometry.nx as usize) as f32;
         let cell_row = (idx / geometry.nx as usize) as f32;
-        let cell_x = grid_origin_x + cell_col * CELL_DOTS as f32 * dx;
-        let cell_y = grid_origin_y + cell_row * CELL_DOTS as f32 * dy;
+        // Top-left corner of the cell, in page-dot space.
+        let cell_origin_dot_x = FINDER_MARGIN_DOTS as f32 + cell_col * CELL_DOTS as f32;
+        let cell_origin_dot_y = FINDER_MARGIN_DOTS as f32 + cell_row * CELL_DOTS as f32;
 
         let mut cell = [0u8; CELL_BYTES];
         for inner_row in 0..CELL_DOTS as usize {
             for inner_col in 0..CELL_DOTS as usize {
-                // Sample at the geometric center of the dot. The
-                // continuous coordinate `cell_x + (col + 0.5) * dx`
-                // sits inside the pixel block of dot `col`; the
-                // pixel containing that point is at `floor` of the
-                // coordinate. `f32 as i64` truncates toward zero,
-                // which equals floor for positive values — and our
-                // grid origin is always inside the bitmap, so the
-                // coordinate is always positive. Using `round`
-                // here would tip sampling onto the WRONG dot at
-                // scale=1 (8.5 → 9 picks dot 9 instead of dot 8).
-                let sx = cell_x + (inner_col as f32 + 0.5) * dx;
-                let sy = cell_y + (inner_row as f32 + 0.5) * dy;
+                // Sample at the dot's geometric center in page-dot
+                // space (the inner_col/inner_row + 0.5 offset).
+                // Project to pixel space via the affine transform.
+                let dot_x = cell_origin_dot_x + inner_col as f32 + 0.5;
+                let dot_y = cell_origin_dot_y + inner_row as f32 + 0.5;
+                let sx = a * dot_x + b * dot_y + tx;
+                let sy = c * dot_x + d * dot_y + ty;
+                // `f32 as i64` truncates toward zero (= floor for
+                // positive coordinates). Using `round` would tip
+                // onto the wrong dot at scale=1 (8.5 → 9 picks dot
+                // 9 instead of dot 8), pinned by the page round-
+                // trip test at scale=1 from Phase 2.5a.
                 let pxi = sx as i64;
                 let pyi = sy as i64;
                 if pxi < 0
