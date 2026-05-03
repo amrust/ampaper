@@ -45,10 +45,11 @@ pub mod page;
 pub mod threshold;
 
 pub use cmyk::{
-    CmyDecodeError, CmyEncodeError, RgbPageBitmap, decode_pages_cmyk, encode_pages_cmyk,
+    CmyDecodeError, CmyEncodeError, RgbPageBitmap, decode_pages_cmyk, decode_pages_cmyk_auto,
+    encode_pages_cmyk,
 };
 pub use codec::{
-    PageDecodeError, PageEncodeError, decode_pages, encode_pages,
+    PageDecodeError, PageEncodeError, decode_pages, decode_pages_auto, encode_pages,
 };
 pub use decoder::{DecodeError, decode};
 pub use encoder::{EncodeError, EncodeOptions, encode};

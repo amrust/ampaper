@@ -40,6 +40,51 @@ enum Codec {
     V3Color,
 }
 
+/// Print-time data-dot density for v3 codecs. Picks
+/// `pixels_per_dot` (the number of 600-DPI printer pixels per
+/// data dot), which sets the dot-per-inch density on the page.
+/// Higher density = more bits per page = harder to scan back
+/// reliably.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Density {
+    /// 100 dot/inch (pixels_per_dot=6). Easiest to scan; biggest
+    /// dots; lowest density. ~80 KB/page raw before compression
+    /// for v3 B&W; ~240 KB for CMY.
+    Loose,
+    /// 200 dot/inch (pixels_per_dot=3). Matches PaperBack 1.10's
+    /// classic mrpods-validated density. Default.
+    #[default]
+    Standard,
+    /// 300 dot/inch (pixels_per_dot=2). Denser; needs a decent
+    /// scanner to read back reliably.
+    Dense,
+    /// 600 dot/inch (pixels_per_dot=1). Maximum theoretical
+    /// density on a 600-DPI printer; every printer-pixel
+    /// fluctuation becomes a dot misclassification at scan
+    /// time. Experimental.
+    Max,
+}
+
+impl Density {
+    fn pixels_per_dot(self) -> u32 {
+        match self {
+            Self::Loose => 6,
+            Self::Standard => 3,
+            Self::Dense => 2,
+            Self::Max => 1,
+        }
+    }
+
+    fn dot_per_inch_label(self) -> &'static str {
+        match self {
+            Self::Loose => "Loose (100 dot/in)",
+            Self::Standard => "Standard (200 dot/in)",
+            Self::Dense => "Dense (300 dot/in)",
+            Self::Max => "Max (600 dot/in)",
+        }
+    }
+}
+
 /// One encoded run's output, tagged by which codec produced it
 /// so `run_save_pdf` can dispatch to the right PDF writer.
 enum PreparedPages {
@@ -68,6 +113,8 @@ pub struct PrintView {
     /// Codec selection. Defaults to Legacy until the v3 codecs have
     /// had real-paper validation.
     codec: Codec,
+    /// Per-dot density for v3 codecs. Ignored for legacy.
+    density: Density,
     last_status: String,
 }
 
@@ -78,6 +125,7 @@ impl Default for PrintView {
             print_dpi: 600,
             v2_password: String::new(),
             codec: Codec::default(),
+            density: Density::default(),
             last_status: String::new(),
         }
     }
@@ -103,6 +151,10 @@ impl PrintView {
         self.show_input_row(ui);
         ui.add_space(8.0);
         self.show_codec_row(ui);
+        if matches!(self.codec, Codec::V3Bw | Codec::V3Color) {
+            ui.add_space(8.0);
+            self.show_density_row(ui);
+        }
         ui.add_space(8.0);
         self.show_dpi_row(ui);
         ui.add_space(8.0);
@@ -208,6 +260,39 @@ impl PrintView {
                 );
             }
         }
+    }
+
+    fn show_density_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Density:");
+            egui::ComboBox::from_id_salt("v3_density")
+                .selected_text(self.density.dot_per_inch_label())
+                .show_ui(ui, |ui| {
+                    for d in [
+                        Density::Loose,
+                        Density::Standard,
+                        Density::Dense,
+                        Density::Max,
+                    ] {
+                        ui.selectable_value(&mut self.density, d, d.dot_per_inch_label());
+                    }
+                });
+        });
+        let helper = match self.density {
+            Density::Loose => {
+                "Biggest dots, easiest to scan back. Lowest density (~80 KB/page raw for B&W, ~240 KB for CMY before zstd)."
+            }
+            Density::Standard => {
+                "Matches PaperBack 1.10's classic 200-dpi calibration. Validated on real consumer flatbed scanners."
+            }
+            Density::Dense => {
+                "Smaller dots; needs a decent scanner. Roughly doubles per-page payload over Standard."
+            }
+            Density::Max => {
+                "Maximum on a 600-DPI printer — every printer-pixel jitter becomes a dot misclassification at scan time. Experimental."
+            }
+        };
+        ui.label(egui::RichText::new(helper).small().weak());
     }
 
     fn show_dpi_row(&mut self, ui: &mut egui::Ui) {
@@ -447,7 +532,7 @@ impl PrintView {
             return None;
         }
 
-        let geom = v3_geometry();
+        let geom = v3_geometry_for(self.density);
         let repair_pct = 25u32;
 
         let mut all_pages: Vec<PrintPage> = Vec::new();
@@ -496,7 +581,7 @@ impl PrintView {
             self.last_status = "no files selected".into();
             return None;
         }
-        let geom = v3_geometry();
+        let geom = v3_geometry_for(self.density);
         let repair_pct = 25u32;
 
         let mut all_pages: Vec<ampaper::v3::RgbPageBitmap> = Vec::new();
@@ -535,15 +620,30 @@ impl PrintView {
     }
 }
 
-/// Shared v3 page geometry for both the B&W and CMY codecs in
-/// the GUI. 200-dpi-equivalent dots on Letter at 600 DPI:
-/// 52 × 68 cells, 3 device pixels per data dot → 5088 × 6528
-/// pixel bitmap, fits inside Letter (5100 × 6600). Matches what
-/// `worker::sniff_v3` and the v3 decode paths expect — encoder
-/// and decoder MUST use the same geometry until auto-detect
-/// lands in a future slice.
-fn v3_geometry() -> ampaper::v3::PageGeometry {
-    ampaper::v3::PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 }
+/// v3 page geometry for the user-selected density. nx and ny
+/// are computed to fit Letter at 600 DPI (the EncodeView's
+/// printer DPI), with cell pitch = 32 dots and 16 dots of
+/// finder/quiet-zone margin (8 each side).
+///
+/// Decoder side (`worker::run_v3_decode` /
+/// `run_v3_cmy_decode`) auto-detects geometry from finder
+/// positions, so encoder and decoder no longer need to share
+/// hardcoded values — the user can pick any density without
+/// breaking decode.
+fn v3_geometry_for(density: Density) -> ampaper::v3::PageGeometry {
+    let pixels_per_dot = density.pixels_per_dot();
+    // Letter at 600 DPI = 5100 × 6600 pixels = 5100/scale × 6600/
+    // scale dots. Subtract 16 dots of finder margin, then divide
+    // by the 32-dot cell pitch.
+    const LETTER_WIDTH_PX: u32 = 5100;
+    const LETTER_HEIGHT_PX: u32 = 6600;
+    let nx = ((LETTER_WIDTH_PX / pixels_per_dot).saturating_sub(16)) / 32;
+    let ny = ((LETTER_HEIGHT_PX / pixels_per_dot).saturating_sub(16)) / 32;
+    ampaper::v3::PageGeometry {
+        nx: nx.max(2),
+        ny: ny.max(2),
+        pixels_per_dot,
+    }
 }
 
 /// Build a full [`ampaper::encoder::EncodeOptions`] from the

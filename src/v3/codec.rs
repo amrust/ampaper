@@ -239,6 +239,30 @@ pub fn encode_pages(
     Ok(bitmaps)
 }
 
+/// Decode page bitmaps back to plaintext, auto-detecting
+/// `nx`/`ny`/`pixels_per_dot` from the first page's finder
+/// positions. Use this when the geometry isn't known — e.g.,
+/// when a v3 PDF gets dropped on the Decode tab and we don't
+/// know which density the encoder picked.
+///
+/// Detects on the first page only; assumes all pages share the
+/// same geometry (which the v3 encoders always emit). If a later
+/// page disagrees, finder detection on it will fail and the
+/// rateless ECC will recover from the surviving pages.
+pub fn decode_pages_auto(pages: &[PageBitmap]) -> Result<Vec<u8>, PageDecodeError> {
+    if pages.is_empty() {
+        return Err(PageDecodeError::NoAnchorFound);
+    }
+    let detected = super::finder::detect_geometry(&pages[0])
+        .map_err(|e| PageDecodeError::PageParse(super::page::ParseError::FinderDetection(e)))?;
+    let geom = PageGeometry {
+        nx: detected.nx,
+        ny: detected.ny,
+        pixels_per_dot: detected.pixels_per_dot,
+    };
+    decode_pages(pages, &geom)
+}
+
 /// Decode a stream of page bitmaps back to plaintext.
 ///
 /// Walks each page, extracts CRC-valid cells, takes the first

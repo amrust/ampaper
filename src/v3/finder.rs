@@ -443,6 +443,122 @@ fn identify_corners(
 /// for "expected position" search (the all-finders detector
 /// doesn't need them), only for the proportion sanity check at
 /// the end.
+/// Geometry derived from a v3 page bitmap's finder positions.
+/// All three of `nx`, `ny`, `pixels_per_dot` are inferred from
+/// the run-length-detected finder centers — the encoder doesn't
+/// need to share a hardcoded geometry with the decoder, the
+/// information is self-describing in the bitmap itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetectedGeometry {
+    pub nx: u32,
+    pub ny: u32,
+    pub pixels_per_dot: u32,
+    pub finders: [FinderHit; 3],
+}
+
+/// Find all corner finders on a page, identify which is TL/TR/BL,
+/// then derive `nx`, `ny`, and `pixels_per_dot` from their
+/// pixel positions.
+///
+/// Math: TL center sits at page-dot `(3.5, 3.5)`, TR center at
+/// `(page_width_dots - 3.5, 3.5)`, BL center at `(3.5,
+/// page_height_dots - 3.5)`. The dot-distance between TL and TR
+/// centers is therefore `page_width_dots - 7`, which equals
+/// `nx * 32 + 9`. So:
+///
+/// ```text
+///   horizontal_dot_distance = (TR.x - TL.x) / unit
+///   nx = (horizontal_dot_distance - 9) / 32
+/// ```
+///
+/// (where `unit` is the pixel-per-dot estimate from the finder
+/// run-length detection, averaged across the three finders.)
+///
+/// `pixels_per_dot` is rounded to the nearest integer ≥ 1
+/// because the renderer only emits integer scales — fractional
+/// values would mean the encoder isn't ours.
+pub fn detect_geometry(bitmap: &PageBitmap) -> Result<DetectedGeometry, FinderError> {
+    if bitmap.pixels.len() < (bitmap.width as usize) * (bitmap.height as usize) {
+        return Err(FinderError::BitmapTooSmall);
+    }
+
+    let threshold = crate::v3::threshold::otsu_threshold(&bitmap.pixels);
+    let clusters = find_all_finders(bitmap, threshold);
+    if clusters.len() < 3 {
+        return Err(FinderError::InsufficientFinders { found: clusters.len() });
+    }
+
+    let mut scored: Vec<(FinderHit, u32)> = clusters
+        .iter()
+        .map(|(hit, _)| (*hit, template_match(bitmap, *hit, threshold)))
+        .filter(|(_, score)| *score >= 40)
+        .collect();
+    if scored.len() < 3 {
+        return Err(FinderError::InsufficientFinders { found: scored.len() });
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let (tl, tr, bl) = identify_corners(scored[0].0, scored[1].0, scored[2].0);
+
+    let unit_avg = (tl.unit + tr.unit + bl.unit) / 3.0;
+    if unit_avg < 1.0 {
+        return Err(FinderError::ProportionMismatch { actual: unit_avg, expected: 1.0 });
+    }
+
+    // Pixel distances between finder centers.
+    let h_pixel =
+        ((tr.center_x - tl.center_x).powi(2) + (tr.center_y - tl.center_y).powi(2)).sqrt();
+    let v_pixel =
+        ((bl.center_x - tl.center_x).powi(2) + (bl.center_y - tl.center_y).powi(2)).sqrt();
+
+    // Convert to dot distances using the measured unit. These
+    // should be integers (page_width_dots - 7) for an axis-
+    // aligned page; for rotated/skewed inputs the fractional
+    // residual goes into the affine transform later.
+    let h_dot = h_pixel / unit_avg;
+    let v_dot = v_pixel / unit_avg;
+    let pw_dots = (h_dot + 7.0).round();
+    let ph_dots = (v_dot + 7.0).round();
+    if pw_dots < 16.0 || ph_dots < 16.0 {
+        return Err(FinderError::ProportionMismatch {
+            actual: pw_dots / ph_dots,
+            expected: 1.0,
+        });
+    }
+
+    // Recover nx, ny from page_dots = nx * 32 + 16. Round and
+    // sanity-check that the residual is small — large residual
+    // means the bitmap doesn't match a v3 page layout.
+    let nx_f = (pw_dots - 16.0) / 32.0;
+    let ny_f = (ph_dots - 16.0) / 32.0;
+    let nx = nx_f.round() as i64;
+    let ny = ny_f.round() as i64;
+    if nx < 1 || ny < 1 {
+        return Err(FinderError::ProportionMismatch {
+            actual: nx_f.min(ny_f),
+            expected: 1.0,
+        });
+    }
+    if (nx_f - nx as f32).abs() > 0.3 || (ny_f - ny as f32).abs() > 0.3 {
+        return Err(FinderError::ProportionMismatch {
+            actual: (nx_f - nx as f32).abs().max((ny_f - ny as f32).abs()),
+            expected: 0.0,
+        });
+    }
+
+    // pixels_per_dot — round to nearest integer ≥ 1. The renderer
+    // only emits integer scales; fractional values come from
+    // print-then-scan resampling and the affine transform handles
+    // them at sample time.
+    let pixels_per_dot = unit_avg.round().max(1.0) as u32;
+
+    Ok(DetectedGeometry {
+        nx: nx as u32,
+        ny: ny as u32,
+        pixels_per_dot,
+        finders: [tl, tr, bl],
+    })
+}
+
 pub fn locate_finders(
     bitmap: &PageBitmap,
     page_width_dots: u32,

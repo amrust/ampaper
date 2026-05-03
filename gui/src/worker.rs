@@ -342,36 +342,31 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
     scan_decode(&pages, password).map_err(|e| format!("{e}"))
 }
 
-/// Try to detect v3 corner finders on a page. Returns true if all
-/// three corner finders are found at the default v3 page geometry.
+/// Try to detect v3 corner finders on a page. Returns true if
+/// `detect_geometry` succeeds — i.e. three corner finders were
+/// found AND the L-shape's dot distances round to a valid
+/// `nx`/`ny` cell count. False positives on legacy v1/v2 PDFs
+/// are very unlikely because the legacy codec doesn't render
+/// QR-style corner finder patterns.
 fn sniff_v3(page: &DecodePage) -> bool {
-    use ampaper::v3::PageGeometry;
-    use ampaper::v3::finder::locate_finders;
+    use ampaper::v3::finder::detect_geometry;
     use ampaper::v3::page::PageBitmap;
 
-    // The Print-tab v3 path uses geometry { nx: 52, ny: 68,
-    // pixels_per_dot: 3 } — 200-dpi-equivalent dots, matching
-    // PaperBack 1.10's classic calibration. That's the fixed
-    // default for first-slice v3; eventually we may sniff
-    // geometry from the bitmap itself, but for now matching the
-    // encoder's hardcoded value is sufficient.
-    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
-    // PageBitmap takes ownership of pixels; clone is unfortunate
-    // but unavoidable without refactoring the v3 API to borrow.
-    // For a Letter-at-600-DPI page that's a one-time ~33 MB clone,
-    // negligible compared to PDF rendering time that already ran.
     let bm = PageBitmap {
         pixels: page.luma.clone(),
         width: page.width,
         height: page.height,
     };
-    locate_finders(&bm, geom.page_width_dots(), geom.page_height_dots()).is_ok()
+    detect_geometry(&bm).is_ok()
 }
 
 fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
-    use ampaper::v3::{PageBitmap, PageGeometry, decode_pages};
+    use ampaper::v3::{PageBitmap, decode_pages_auto};
 
-    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
+    // Auto-detect geometry from the first page's finders. The
+    // encoder no longer needs to share a hardcoded geometry with
+    // the decoder — Density UI selections (Loose / Standard /
+    // Dense / Max) all decode through the same path here.
     let pages: Vec<PageBitmap> = req
         .pages
         .iter()
@@ -381,7 +376,7 @@ fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
             height: p.height,
         })
         .collect();
-    decode_pages(&pages, &geom).map_err(|e| format!("v3 decode: {e}"))
+    decode_pages_auto(&pages).map_err(|e| format!("v3 decode: {e}"))
 }
 
 /// Sample pixels across the page; report whether any have
@@ -425,9 +420,8 @@ fn has_color(page: &DecodePage) -> bool {
 }
 
 fn run_v3_cmy_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
-    use ampaper::v3::{PageGeometry, RgbPageBitmap, decode_pages_cmyk};
+    use ampaper::v3::{RgbPageBitmap, decode_pages_cmyk_auto};
 
-    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
     let pages: Vec<RgbPageBitmap> = req
         .pages
         .iter()
@@ -437,7 +431,7 @@ fn run_v3_cmy_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
             height: p.height,
         })
         .collect();
-    decode_pages_cmyk(&pages, &geom).map_err(|e| format!("v3 CMY decode: {e}"))
+    decode_pages_cmyk_auto(&pages).map_err(|e| format!("v3 CMY decode: {e}"))
 }
 
 /// Run scan_extract over a single page and bucket each resulting

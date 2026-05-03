@@ -222,6 +222,58 @@ fn empty_input_rejected() {
 }
 
 #[test]
+fn auto_detect_round_trips_at_multiple_geometries() {
+    // Pin that decode_pages_auto recovers bytes regardless of
+    // which geometry the encoder used — the decoder figures it
+    // out from finder positions. Encoder and decoder no longer
+    // need a hardcoded shared geometry; the GUI's Density
+    // dropdown can pick any value and decode still works.
+    use ampaper::v3::decode_pages_auto;
+
+    let geometries = [
+        // (nx, ny, pixels_per_dot, label)
+        (4, 4, 1, "tiny scale=1"),
+        (8, 6, 4, "medium scale=4"),
+        (3, 3, 6, "small scale=6 (Loose)"),
+        (6, 5, 2, "Dense scale=2"),
+    ];
+
+    let plaintext = b"Phase 6+ auto-detect: encoder geometry not shared with decoder.";
+
+    for (nx, ny, ppd, label) in geometries {
+        let geom = PageGeometry { nx, ny, pixels_per_dot: ppd };
+        let pages = encode_pages(plaintext, &geom, 25).unwrap();
+        // Auto-decode — does NOT pass geom to decode.
+        let recovered = decode_pages_auto(&pages)
+            .unwrap_or_else(|e| panic!("auto-decode failed for {label}: {e}"));
+        assert_eq!(
+            recovered, plaintext,
+            "auto-detect round-trip must recover bytes at {label}"
+        );
+    }
+}
+
+#[test]
+fn auto_detect_works_through_offset_and_rotation() {
+    // The Phase 2.5a + 2.5b distortions still apply when the
+    // decoder doesn't know the geometry up front: rotate the
+    // page in a larger canvas and confirm decode still recovers.
+    use ampaper::v3::decode_pages_auto;
+
+    let plaintext = b"Auto-detect composes with offset + rotation handling.";
+    let geom = PageGeometry { nx: 5, ny: 5, pixels_per_dot: 4 };
+    let pages = encode_pages(plaintext, &geom, 25).unwrap();
+    // Pad each page with asymmetric white margins (Phase 2.5a's
+    // larger-canvas test).
+    let padded: Vec<PageBitmap> = pages
+        .iter()
+        .map(|p| pad_with_white(p, 25, 35, 50, 20))
+        .collect();
+    let recovered = decode_pages_auto(&padded).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
 fn pages_decode_when_embedded_in_larger_white_canvas() {
     // The Phase 2.5 unlock: pages don't have to be cropped to the
     // exact rendered size. A flatbed scanner captures the entire

@@ -340,6 +340,43 @@ which is what the detector keys on. Same shape as a QR finder.
   fourth corner for "no finder" gives Phase 2.5b a free
   orientation signal without a wire-format bump.
 
+## Geometry auto-detect (Phase 2.5d)
+
+Implemented in `finder::detect_geometry`. The decoder no longer
+needs to share a hardcoded `(nx, ny, pixels_per_dot)` with the
+encoder — all three values are inferred from the corner finder
+positions in the rendered bitmap.
+
+The math:
+
+```
+TL center is at page-dot (3.5, 3.5)
+TR center is at page-dot (page_width_dots - 3.5, 3.5)
+BL center is at page-dot (3.5, page_height_dots - 3.5)
+```
+
+So in PIXEL space:
+
+```
+horizontal_pixel_distance(TL, TR) = (page_width_dots - 7) · pixels_per_dot
+vertical_pixel_distance(TL, BL)   = (page_height_dots - 7) · pixels_per_dot
+```
+
+The finder run-length detector already returns a `unit` estimate
+(pixels per dot) — average it across the three finders to
+suppress per-finder noise, divide the pixel distance by it to
+get a dot-distance, add back the +7 we subtracted, and unbump
+the +16 finder-margin to recover `nx · 32` and `ny · 32`. Round
+each to the nearest integer cell count; reject if the residual
+exceeds ±0.3 cells.
+
+`decode_pages_auto` and `decode_pages_cmyk_auto` wrap this:
+detect geometry on page 0, then call the standard
+`decode_pages` / `decode_pages_cmyk`. The GUI uses the auto
+variants exclusively — the user's encoder Density choice is now
+self-describing in the bitmap, so changing it doesn't require a
+matching decoder update.
+
 ## Phase 2.5b: rotation correction via affine transform
 
 This is the slice currently extending `src/v3/finder.rs` and

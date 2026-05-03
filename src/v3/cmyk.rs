@@ -286,6 +286,28 @@ pub fn encode_pages_cmyk(
     Ok(rgb_pages)
 }
 
+/// Decode CMY page bitmaps back to plaintext, auto-detecting
+/// `nx`/`ny`/`pixels_per_dot` from the first page's finder
+/// positions (decomposed cyan layer). Use this when the
+/// geometry isn't known to the caller.
+pub fn decode_pages_cmyk_auto(pages: &[RgbPageBitmap]) -> Result<Vec<u8>, CmyDecodeError> {
+    if pages.is_empty() {
+        return Err(CmyDecodeError::NoAnchorFound);
+    }
+    // Decompose the first page; finder detection on the C layer
+    // suffices because all 3 channels carry the same finder
+    // pattern (they get rendered as composite-black corners).
+    let (c_layer, _, _) = decompose_cmy(&pages[0]);
+    let detected = super::finder::detect_geometry(&c_layer)
+        .map_err(|e| CmyDecodeError::PageParse(super::page::ParseError::FinderDetection(e)))?;
+    let geom = PageGeometry {
+        nx: detected.nx,
+        ny: detected.ny,
+        pixels_per_dot: detected.pixels_per_dot,
+    };
+    decode_pages_cmyk(pages, &geom)
+}
+
 /// Decode CMY page bitmaps back to plaintext.
 pub fn decode_pages_cmyk(
     pages: &[RgbPageBitmap],
