@@ -133,14 +133,21 @@ impl From<ParseError> for PageDecodeError {
 /// page may have trailing blank cells (rendered as all-white) when
 /// the packet stream runs out.
 ///
-/// `repair_packets` is the number of RaptorQ repair packets above
-/// the source K. RaptorQ's recovery probability is `1 - 1/256^(h+1)`
-/// at receive overhead h, so even modest values give effectively
-/// perfect recovery in the absence of pathological cell loss.
+/// `repair_overhead_percent` controls the RaptorQ repair budget as
+/// a percentage of the source-symbol count. 25 means 25% extra
+/// packets — total emitted = K · 1.25, so the receiver can lose
+/// up to ~20% of cells and still decode.
+///
+/// The repair count is computed AFTER compression, so callers don't
+/// need to know whether or how much zstd shrunk the input. (Earlier
+/// API took an absolute packet count, which led to a bug where
+/// 25%-of-raw-K turned into ~100%-of-compressed-K when zstd
+/// quartered the input — emitting twice the necessary repair and
+/// doubling the page count on text-like inputs.)
 pub fn encode_pages(
     plaintext: &[u8],
     geometry: &PageGeometry,
-    repair_packets: u32,
+    repair_overhead_percent: u32,
 ) -> Result<Vec<PageBitmap>, PageEncodeError> {
     if plaintext.is_empty() {
         return Err(PageEncodeError::EmptyInput);
@@ -169,7 +176,13 @@ pub fn encode_pages(
     // 1b. RaptorQ-encode the (compressed-or-not) bytes.
     let encoder = Encoder::with_defaults(rq_input, RAPTORQ_MTU);
     let oti_bytes = encoder.get_config().serialize();
-    let packets = encoder.get_encoded_packets(repair_packets);
+    // Compute repair packet count from the ACTUAL post-compression
+    // K. Floor of 5 ensures even tiny inputs get some loss
+    // tolerance (a 1-cell payload with 0 repair would have to
+    // round-trip every cell perfectly).
+    let k = rq_input.len().div_ceil(SYMBOL_BYTES) as u32;
+    let repair = ((k * repair_overhead_percent) / 100).max(5);
+    let packets = encoder.get_encoded_packets(repair);
 
     // 2. How many pages do we need? cells/page - 1 data slots per
     // page (the first slot is the anchor).

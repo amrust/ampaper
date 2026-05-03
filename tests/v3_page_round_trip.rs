@@ -113,7 +113,12 @@ fn anchor_loss_on_first_pages_recovers_via_later_anchor() {
     // still works using anchors from the surviving pages.
     let plaintext = lcg_bytes(4000, 0xC0DE_C0DE);
     let geom = small_geometry();
-    let mut pages = encode_pages(&plaintext, &geom, 30).unwrap();
+    // 100% repair overhead so the multi-page assertion holds even
+    // after the encoder's per-K computation. With K ≈ 34 on this
+    // input, repair ≈ 34 packets → ~5 pages at 15 data slots/page,
+    // plenty for the "smash half the anchors and still decode"
+    // demonstration this test pins.
+    let mut pages = encode_pages(&plaintext, &geom, 100).unwrap();
     assert!(pages.len() >= 4, "test setup needs ≥ 4 pages");
 
     // Corrupt the anchor cell on the first half of the pages.
@@ -144,7 +149,10 @@ fn dropped_pages_recover_via_rateless_ecc() {
     // page level.
     let plaintext = lcg_bytes(3000, 0xBEEF_BEEF);
     let geom = small_geometry();
-    let pages = encode_pages(&plaintext, &geom, 30).unwrap();
+    // 100% repair overhead so dropping one page (~15 lost cells)
+    // still leaves enough surviving packets to decode K=25 source
+    // symbols.
+    let pages = encode_pages(&plaintext, &geom, 100).unwrap();
     assert!(pages.len() >= 3, "test setup needs ≥ 3 pages");
 
     let mut survivors: Vec<PageBitmap> = pages.to_vec();

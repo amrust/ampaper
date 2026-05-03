@@ -34,7 +34,7 @@ use worker::render_pdf_pages;
 /// `worker::run_v3_decode` use, otherwise the in-app round-trip
 /// would silently mis-decode.
 fn gui_v3_geometry() -> PageGeometry {
-    PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 }
+    PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 }
 }
 
 #[test]

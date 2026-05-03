@@ -577,21 +577,42 @@ at offset 29. v3 has no installed paper base yet, so the
 incompatibility is academic — but worth pinning that this is
 the wire-format moment if paper does ship before Phase 3a.
 
-### Density at Phase 3a + current geometry
+### Repair-overhead API
 
-GUI default: `pixels_per_dot=6`, `nx=26`, `ny=33` → 858 cells/page,
-857 data cells × 120 bytes/cell ÷ 1.25 (RaptorQ repair) = **80 KB
+`encode_pages` takes a `repair_overhead_percent: u32` parameter
+(not an absolute packet count). The actual repair count is
+computed internally as `K · percent / 100`, where `K` is the
+RaptorQ source-symbol count AFTER compression. The percentage
+spelling means callers don't need to know whether or how much
+zstd shrunk the input — earlier API took an absolute packet
+count, which led to a real bug where 25%-of-raw-K turned into
+~100%-of-compressed-K when zstd quartered the input, doubling
+the page count on text-like inputs.
+
+Default in the GUI: 25% — recovers from up to ~20% cell loss
+with high probability per RaptorQ's `1 - 1/256^(h+1)` recovery
+formula at receive overhead h.
+
+### Density at Phase 3a + current GUI geometry (200-dpi-equiv)
+
+GUI default after the Phase 3a + repair-fix work:
+`pixels_per_dot=3`, `nx=52`, `ny=68` → 3536 cells/page, 3535 data
+cells × 120 bytes/cell ÷ 1.25 (25% repair overhead) ≈ **331 KB
 raw payload per page**. With zstd at 3-5× on text:
 
-- Text-like input: **240-400 KB compressed-equivalent per page**
-- Already-compressed input: **80 KB per page** (compression
-  passed through unchanged)
+- Text-like input: **~1.0-1.6 MB compressed-equivalent per page**
+- Already-compressed input: **331 KB per page** (zstd skipped)
 
-Comparison: PaperBack 1.10 at 200 dpi + bzip2 carries ~666 KB-1.1
-MB effective per page. The remaining gap closes at Phase 4 (200-
-dpi-equivalent dot density via `pixels_per_dot=3`), which lifts
-v3 to ~960 KB-1.6 MB compressed-equivalent per page,
-matching/beating mrpods.
+Comparison: PaperBack 1.10 at 200 dpi + bzip2 carries
+~666 KB-1.1 MB effective per page (~5-6 pages for War & Peace
+plain text). v3 at the same dot density + zstd matches or
+exceeds that — projected ~3 pages for War & Peace plain text.
+
+Earlier `pixels_per_dot=6` (100-dpi-equivalent) defaults gave
+80 KB raw / page and 17+ pages on War & Peace, because
+1) per-page cell count was 4× lower at the same Letter sheet,
+2) the absolute-repair API double-counted overhead. Both
+fixed in Phase 3a.
 
 ## Channel asymmetry (Phase 6+ planning note)
 

@@ -355,15 +355,20 @@ impl PrintView {
             return None;
         }
 
-        // Hardcoded geometry: 26 × 33 cells at 6 device pixels per
-        // data dot → 5088 × 6432 pixels per page, fits inside Letter
-        // at 600 DPI (5100 × 6600). Each cell carries 120 bytes of
-        // RaptorQ symbol payload, so one page holds ~100 KB of
-        // source data after the per-page anchor + RaptorQ overhead.
-        let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
-        // 25% repair packets — generous loss tolerance starting
-        // point. Tighten once real-scan loss profiles say it can
-        // be smaller, loosen if real scans fail to recover.
+        // 200-dpi-equivalent geometry: 52 × 68 cells at 3 device
+        // pixels per data dot → 5088 × 6528 pixels per page, fits
+        // inside Letter at 600 DPI (5100 × 6600). Matches PaperBack
+        // 1.10's classic 200-dpi calibration that mrpods proved
+        // works on real consumer-flatbed scans. Each cell carries
+        // 120 bytes; a page holds ~331 KB raw payload after the
+        // anchor cell + RaptorQ repair, so War & Peace in zstd
+        // (~800 KB) fits in 3 pages instead of the 17 we'd need
+        // at 100-dpi-equivalent + over-allocated repair.
+        let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
+        // 25% repair-packet overhead. encode_pages computes the
+        // absolute count internally based on POST-compression K,
+        // so this is the budget the receiver actually gets — no
+        // double-allocation across the compression layer.
         let repair_pct = 25u32;
 
         let mut all_pages: Vec<PrintPage> = Vec::new();
@@ -380,12 +385,7 @@ impl PrintView {
                     format!("{}: v3 codec rejects empty input", path.display());
                 return None;
             }
-            // Repair packet count: 25% of source K, minimum 5.
-            // Source K ≈ ceil(bytes / 120) (per-cell symbol size).
-            let source_k = bytes.len().div_ceil(120) as u32;
-            let repair = ((source_k * repair_pct) / 100).max(5);
-
-            let pages = match encode_pages(&bytes, &geom, repair) {
+            let pages = match encode_pages(&bytes, &geom, repair_pct) {
                 Ok(p) => p,
                 Err(e) => {
                     self.last_status = format!("{}: v3 encode: {e}", path.display());

@@ -335,12 +335,13 @@ fn sniff_v3(page: &DecodePage) -> bool {
     use ampaper::v3::finder::locate_finders;
     use ampaper::v3::page::PageBitmap;
 
-    // The Print-tab v3 path uses geometry { nx: 26, ny: 33,
-    // pixels_per_dot: 6 }. That's the fixed default for first-
-    // slice v3; eventually we may sniff geometry from the bitmap
-    // itself, but for now matching the encoder's hardcoded value
-    // is sufficient.
-    let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
+    // The Print-tab v3 path uses geometry { nx: 52, ny: 68,
+    // pixels_per_dot: 3 } — 200-dpi-equivalent dots, matching
+    // PaperBack 1.10's classic calibration. That's the fixed
+    // default for first-slice v3; eventually we may sniff
+    // geometry from the bitmap itself, but for now matching the
+    // encoder's hardcoded value is sufficient.
+    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
     // PageBitmap takes ownership of pixels; clone is unfortunate
     // but unavoidable without refactoring the v3 API to borrow.
     // For a Letter-at-600-DPI page that's a one-time ~33 MB clone,
@@ -356,7 +357,7 @@ fn sniff_v3(page: &DecodePage) -> bool {
 fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
     use ampaper::v3::{PageBitmap, PageGeometry, decode_pages};
 
-    let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
+    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
     let pages: Vec<PageBitmap> = req
         .pages
         .iter()
