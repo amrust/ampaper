@@ -1,12 +1,15 @@
 # ampaper v3 — wire format spec
 
-**Status:** Phase 1 (bytes-level codec) + Phase 2 first slice (cell
-+ page-bitmap layer, synthetic round-trip). Finder patterns and
-real-scanner registration are still deferred to Phase 2.5; phases
-3+ (compression, encryption, density, modulation) are deferred to
-their respective milestones (see "Roadmap" below). Both the
-bytes-level and the page-level wire formats defined here are stable;
-later phases extend them without breaking them.
+**Status:** Phase 1 (bytes-level codec) + Phase 2 (cell layer) +
+Phase 2.5 first slice (QR-style corner finder patterns, finder-
+based grid registration with offset + scale-drift tolerance).
+Rotation handling, adaptive thresholding, and real-scanner
+noise tolerance are deferred to subsequent Phase 2.5 sub-slices.
+Phases 3+ (compression, encryption, density, modulation) are
+deferred to their respective milestones (see "Roadmap" below).
+The bytes-level, page-level, and Phase 2.5 page-bitmap wire
+formats defined here are stable; later phases extend them without
+breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -51,16 +54,18 @@ v3 addresses all three:
 
 ## Roadmap
 
-| Phase | Adds                                              | Target density vs v1 at 100 dot/in |
-|-------|---------------------------------------------------|-----------------------------------|
-| 1     | Bytes-level RaptorQ codec, magic + OTI header     | n/a (no bitmap layer yet)         |
-| 2.0   | Cell layout, page bitmap render/parse, anchor block | n/a (synthetic round-trip)      |
-| 2.5   | QR-style finder patterns + scan-side registration | 1.3-1.5×                          |
-| 3     | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
-| 4     | High dot density (250-300 dot/in)                 | ~3×                               |
-| 5     | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
-| 6     | CMYK 1-bit-per-channel (~3 effective bits/dot)    | ~8-9× best case                   |
-| 7     | Multi-level CMYK (premium, opt-in)                | ~15-20× best case                 |
+| Phase  | Adds                                              | Target density vs v1 at 100 dot/in |
+|--------|---------------------------------------------------|-----------------------------------|
+| 1      | Bytes-level RaptorQ codec, magic + OTI header     | n/a (no bitmap layer yet)         |
+| 2.0    | Cell layout, page bitmap render/parse, anchor block | n/a (synthetic round-trip)      |
+| 2.5a   | QR-style corner finders + offset/scale-drift detection | n/a (still synthetic — but page can sit anywhere in a larger bitmap) |
+| 2.5b   | Rotation correction via affine transform from 3 finders | n/a                          |
+| 2.5c   | Adaptive thresholding + sub-pixel sampling        | 1.3-1.5×                          |
+| 3      | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
+| 4      | High dot density (250-300 dot/in)                 | ~3×                               |
+| 5      | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
+| 6      | CMYK 1-bit-per-channel (~3 effective bits/dot)    | ~8-9× best case                   |
+| 7      | Multi-level CMYK (premium, opt-in)                | ~15-20× best case                 |
 
 Each phase ships an encoder + decoder + acceptance test. Phase 1
 acceptance: round-trip 1 MB byte buffers + survive 33% packet drop
@@ -228,18 +233,111 @@ encoder fills pages sequentially: page 0 carries the first
 may have trailing all-zero cells (which fail the CRC and are
 skipped by the decoder).
 
-### Phase 2.5 will add
+## Phase 2.5 first slice: corner finder patterns
 
-- QR-style finder patterns at the four page corners. Lets a
-  scan-side decoder find the page boundary and correct skew /
-  rotation before sampling cell pixels.
-- Edge timing tracks (alternating black/white dots along the top
-  and left margins) for cell-grid registration. Replaces the
-  current "decoder must know the geometry exactly" assumption.
-- Threshold + dot-center sampling that tolerates real scanner
-  noise, ink bleed, and cheap-CCD blur. The current parser
-  samples the geometric center of each dot's pixel block, which
-  is fine for synthetic bitmaps but not yet for paper.
+This is the slice currently implemented in `src/v3/finder.rs` and
+the updated `src/v3/page.rs`. Adds three QR-style 7×7 finder
+patterns at the corners of every v3 page bitmap and rewrites
+`parse_page` to find the data grid using them — the decoder no
+longer needs the page bitmap to be cropped to exact size or
+rendered at exactly the geometry's `pixels_per_dot`.
+
+### Page layout (Phase 2.5)
+
+Page bitmap dimensions in dots:
+
+```
+page_width_dots  = nx · 32 + 2 · FINDER_MARGIN_DOTS
+page_height_dots = ny · 32 + 2 · FINDER_MARGIN_DOTS
+```
+
+where `FINDER_MARGIN_DOTS = 8` (= `FINDER_SIZE_DOTS` 7 +
+`FINDER_QUIET_DOTS` 1). The page bitmap is then scaled by
+`pixels_per_dot` to its final pixel dimensions.
+
+Three finders sit at:
+
+- Top-left: dots `(0..7, 0..7)`
+- Top-right: dots `(page_width - 7..page_width, 0..7)`
+- Bottom-left: dots `(0..7, page_height - 7..page_height)`
+
+The bottom-right corner is deliberately empty. The asymmetry
+provides an unambiguous orientation signal, used by the planned
+Phase 2.5b rotation handler.
+
+The data grid sits at dot offset `(FINDER_MARGIN_DOTS,
+FINDER_MARGIN_DOTS)` from the page's outer edge. Cells are laid
+out exactly as in Phase 2.0 inside the data grid.
+
+### Finder pattern (7×7 dots)
+
+```
+B B B B B B B
+B W W W W W B
+B W B B B W B
+B W B B B W B    ← center dot at (3, 3)
+B W B B B W B
+B W W W W W B
+B B B B B B B
+```
+
+A horizontal or vertical scan through the center yields a
+`1:1:3:1:1` dark:light:dark:light:dark run-length signature —
+which is what the detector keys on. Same shape as a QR finder.
+
+### Detection algorithm (Phase 2.5 first slice)
+
+1. Raster-scan rows from the top of the bitmap. For each row,
+   collect run-lengths and look for a 5-run sequence matching
+   `1:1:3:1:1` dark:light:dark:light:dark within ±50%
+   per-segment tolerance.
+2. On a row hit, verify with a column scan at the candidate
+   center column. Both row and column unit estimates must agree
+   within ±25% (otherwise the candidate is a chance run-length
+   collision).
+3. The first verified hit is the top-left finder.
+4. From the top-left finder's `(center_x, center_y, unit)` and
+   the supplied `(page_width_dots, page_height_dots)`, compute
+   the expected positions of the top-right and bottom-left
+   finders. Search for finders within ±6 dots of those expected
+   positions (generous tolerance to absorb modest scale drift).
+5. Compute per-axis pixels-per-dot (`dx`, `dy`) from the
+   horizontal and vertical finder distances. Use these — not the
+   geometry's stored `pixels_per_dot` — for cell sampling.
+6. Sample each cell's 32×32 dots at the geometric center of
+   each dot's pixel block (`floor(grid_origin + (col + 0.5) ·
+   dx)`). Fixed midpoint threshold (`< 128 = black`).
+
+### Pinned design notes (gotchas caught en route)
+
+- **Finder center sits at page-dot 3.5, not 3.** The middle dot
+  of the 7×7 finder is at index (3, 3); its geometric center in
+  continuous coordinates is at (3.5, 3.5) — a half-dot offset.
+  The grid-origin computation must subtract 3.5, not 3, from
+  `FINDER_MARGIN_DOTS`. Off-by-half here costs a half-dot
+  mis-sample at every scale and corrupts every cell.
+- **Cell sampling uses floor, not round.** At `pixels_per_dot=1`,
+  the continuous sample coordinate is always X.5; rounding
+  half-away-from-zero would tip every sample onto the next dot
+  and produce all-wrong cell content. `f32 as i64` truncation
+  (= floor for positive coordinates) gives the correct dot.
+- **No bottom-right finder.** Three finders are enough for the
+  current axis-aligned offset/scale handling, and reserving the
+  fourth corner for "no finder" gives Phase 2.5b a free
+  orientation signal without a wire-format bump.
+
+### Phase 2.5b/c will add
+
+- **Rotation handling.** Use the three finder centers' relative
+  positions to compute an affine (or homography) transform from
+  page-dot space to bitmap-pixel space. Replaces the current
+  axis-aligned assumption.
+- **Adaptive thresholding.** Otsu or per-region thresholding
+  instead of fixed `< 128`. Real scanner output rarely has the
+  bimodal histogram synthetic bitmaps do.
+- **Sub-pixel sampling.** Integrate over each dot's pixel area
+  rather than sampling the geometric-center pixel. Suppresses
+  edge bleed where ink dots aren't perfect circles.
 
 ## Channel asymmetry (Phase 6+ planning note)
 

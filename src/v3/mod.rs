@@ -38,6 +38,7 @@ pub mod cell;
 pub mod codec;
 pub mod decoder;
 pub mod encoder;
+pub mod finder;
 pub mod format;
 pub mod page;
 
@@ -46,4 +47,4 @@ pub use codec::{
 };
 pub use decoder::{DecodeError, decode};
 pub use encoder::{EncodeError, EncodeOptions, encode};
-pub use page::{PageBitmap, PageGeometry};
+pub use page::{PageBitmap, PageGeometry, pad_with_white};

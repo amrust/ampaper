@@ -8,7 +8,7 @@
 // exact geometry. Real-scanner round-trip (with calibration, finder
 // patterns, noise tolerance) is the next slice.
 
-use ampaper::v3::{PageBitmap, PageGeometry, decode_pages, encode_pages};
+use ampaper::v3::{PageBitmap, PageGeometry, decode_pages, encode_pages, pad_with_white};
 
 fn letter_geometry() -> PageGeometry {
     // 12×18 cells = 216 cells/page. At RAPTORQ_MTU=124 → T=120, each
@@ -103,15 +103,16 @@ fn anchor_loss_on_first_pages_recovers_via_later_anchor() {
     assert!(pages.len() >= 4, "test setup needs ≥ 4 pages");
 
     // Corrupt the anchor cell on the first half of the pages.
-    // Anchor sits at cell 0, top-left of the bitmap, occupying
-    // 32×32 dot pixels at scale=1.
+    // After Phase 2.5, the anchor sits at the top-left of the
+    // DATA GRID, which is offset by FINDER_MARGIN_DOTS (= 8) from
+    // the bitmap origin to leave room for the corner finder
+    // pattern. At pixels_per_dot=1 the anchor cell occupies pixels
+    // [(8, 8), (40, 40)).
     let half = pages.len() / 2;
     for page in pages.iter_mut().take(half) {
-        // Smash the anchor's pixel block to all-white — the parser
-        // will read all-zero cell bytes there, fail CRC, and skip.
-        for y in 0..32 {
+        for y in 8..40 {
             let row_start = (y * page.width) as usize;
-            for x in 0..32 {
+            for x in 8..40 {
                 page.pixels[row_start + x] = ampaper::v3::page::WHITE;
             }
         }
@@ -145,6 +146,88 @@ fn dropped_pages_recover_via_rateless_ecc() {
 fn empty_input_rejected() {
     let err = encode_pages(b"", &small_geometry(), 5).unwrap_err();
     assert!(matches!(err, ampaper::v3::PageEncodeError::EmptyInput));
+}
+
+#[test]
+fn pages_decode_when_embedded_in_larger_white_canvas() {
+    // The Phase 2.5 unlock: pages don't have to be cropped to the
+    // exact rendered size. A flatbed scanner captures the entire
+    // sheet of paper; the actual data area sits in the middle with
+    // arbitrary white margins around it. The QR-style corner
+    // finders make the page locatable inside that larger canvas.
+    let plaintext: Vec<u8> = (0u32..2000)
+        .map(|i| (i.wrapping_mul(19).wrapping_add(5) & 0xFF) as u8)
+        .collect();
+    let geom = small_geometry();
+    let pages = encode_pages(&plaintext, &geom, 10).unwrap();
+
+    // Pad each page asymmetrically — different paddings on each
+    // edge, simulating real scanner behavior where the page is
+    // rarely centered exactly.
+    let padded: Vec<PageBitmap> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| {
+            // Rotate paddings per page so different pages get
+            // different layouts — proves the detector isn't
+            // exploiting any fixed-position assumption.
+            let rotation = i as u32 * 7;
+            pad_with_white(
+                page,
+                40 + rotation,
+                30 + rotation * 2,
+                60 - rotation,
+                25 + rotation,
+            )
+        })
+        .collect();
+
+    let recovered = decode_pages(&padded, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn pages_decode_with_modest_scale_drift() {
+    // Phase 2.5 derives `pixels_per_dot` from the measured finder
+    // distances, not from the geometry's stored value. So a page
+    // rendered at scale=4 then upscaled to scale=5 (simulating a
+    // print-scan resolution mismatch) should still decode — the
+    // parser sees larger finder distances and adjusts dx/dy
+    // accordingly. Without this property the encode-time DPI and
+    // decode-time DPI would have to match exactly.
+    let plaintext = b"Phase 2.5 tolerates scale drift between print and scan.";
+    let encode_geom = PageGeometry { nx: 4, ny: 4, pixels_per_dot: 4 };
+    let pages = encode_pages(plaintext, &encode_geom, 5).unwrap();
+    assert_eq!(pages.len(), 1);
+
+    // Upscale the bitmap by 1.25× via nearest-neighbor: every pixel
+    // becomes a 5×4 block (alternating to get the 1.25× ratio).
+    // This simulates a print-scan path where the scanner captures
+    // at 1.25× the encode resolution.
+    let src = &pages[0];
+    let new_w = src.width * 5 / 4;
+    let new_h = src.height * 5 / 4;
+    let mut upscaled = vec![ampaper::v3::page::WHITE; (new_w * new_h) as usize];
+    for ny in 0..new_h {
+        let sy = (ny * 4 / 5).min(src.height - 1);
+        for nx in 0..new_w {
+            let sx = (nx * 4 / 5).min(src.width - 1);
+            upscaled[(ny * new_w + nx) as usize] =
+                src.pixels[(sy * src.width + sx) as usize];
+        }
+    }
+    let scaled_page = PageBitmap {
+        pixels: upscaled,
+        width: new_w,
+        height: new_h,
+    };
+
+    // Decode using the SAME geometry the encoder used. The parser
+    // measures the actual scale from finder positions and uses it
+    // for sampling; the geometry's `pixels_per_dot` field is now
+    // a hint, not a hard requirement.
+    let recovered = decode_pages(&[scaled_page], &encode_geom).unwrap();
+    assert_eq!(recovered, plaintext);
 }
 
 #[test]
