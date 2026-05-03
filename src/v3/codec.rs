@@ -27,10 +27,15 @@
 use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
 
 use super::cell::{
-    self, AnchorPayload, CELL_BYTES, DecodedCell, RAPTORQ_MTU, SYMBOL_BYTES,
+    self, AnchorPayload, CELL_BYTES, Compression, DecodedCell, RAPTORQ_MTU, SYMBOL_BYTES,
     encode_anchor_cell, encode_data_cell,
 };
 use super::page::{PageBitmap, PageGeometry, ParseError, parse_page, render_page};
+
+/// zstd compression level used by `encode_pages`. Level 22 is
+/// `--ultra-22`, the densest setting; for paper-archive use the
+/// encoder runs once per file so we don't care about encode speed.
+const ZSTD_LEVEL: i32 = 22;
 
 #[derive(Debug)]
 pub enum PageEncodeError {
@@ -66,15 +71,25 @@ pub enum PageDecodeError {
     /// RaptorQ. Indicates either total page loss or the wrong
     /// geometry was supplied.
     NoAnchorFound,
-    /// Anchors disagree about the OTI / file size / total pages.
-    /// Most likely the user mixed pages from two different encode
-    /// runs, or one anchor is corrupted in a way the CRC didn't
-    /// catch (rare).
+    /// Anchors disagree about the OTI / file size / total pages
+    /// / compression flag. Most likely the user mixed pages from
+    /// two different encode runs, or one anchor is corrupted in
+    /// a way the CRC didn't catch (rare).
     AnchorMismatch,
     /// RaptorQ exhausted the surviving packets without converging.
     /// Too many cells were lost or damaged for the chosen repair
     /// budget.
     NoSolution,
+    /// Zstd decompression failed on the post-RaptorQ recovered
+    /// bytes. Most likely the source pages were corrupt in a way
+    /// that survived per-cell CRC but mangled the compressed
+    /// stream — extremely unlikely but worth distinguishing
+    /// from a NoSolution failure.
+    DecompressionFailed(String),
+    /// Decompressed output's length doesn't match the
+    /// `file_size` the anchor cell claimed. Indicates
+    /// metadata-vs-data inconsistency, likely a corrupt anchor.
+    SizeMismatch { expected: u64, actual: u64 },
 }
 
 impl core::fmt::Display for PageDecodeError {
@@ -90,6 +105,11 @@ impl core::fmt::Display for PageDecodeError {
             ),
             Self::NoSolution => f.write_str(
                 "v3 decode_pages: RaptorQ did not converge — too few or too damaged cells",
+            ),
+            Self::DecompressionFailed(e) => write!(f, "v3 decode_pages: zstd decompression: {e}"),
+            Self::SizeMismatch { expected, actual } => write!(
+                f,
+                "v3 decode_pages: decompressed size {actual} doesn't match anchor's claimed file_size {expected}"
             ),
         }
     }
@@ -132,8 +152,22 @@ pub fn encode_pages(
         });
     }
 
-    // 1. RaptorQ-encode the plaintext at our cell-fixed MTU.
-    let encoder = Encoder::with_defaults(plaintext, RAPTORQ_MTU);
+    // 1a. Try compressing with zstd. Use the result only when
+    // it's actually smaller than the original — already-compressed
+    // inputs (PDFs, JPEGs, ZIPs) typically come out the SAME size
+    // or slightly bigger, in which case we ship raw bytes and set
+    // the anchor's compression flag to None. Saves zstd's
+    // ~14-byte frame overhead on incompressible inputs and skips
+    // the decompress step at decode time.
+    let compressed = zstd::encode_all(plaintext, ZSTD_LEVEL).ok();
+    let (rq_input_owned, compression) = match compressed {
+        Some(c) if c.len() < plaintext.len() => (c, Compression::Zstd),
+        _ => (plaintext.to_vec(), Compression::None),
+    };
+    let rq_input: &[u8] = &rq_input_owned;
+
+    // 1b. RaptorQ-encode the (compressed-or-not) bytes.
+    let encoder = Encoder::with_defaults(rq_input, RAPTORQ_MTU);
     let oti_bytes = encoder.get_config().serialize();
     let packets = encoder.get_encoded_packets(repair_packets);
 
@@ -148,12 +182,16 @@ pub fn encode_pages(
     for page_idx in 0..total_pages {
         let mut cells: Vec<[u8; CELL_BYTES]> = Vec::with_capacity(cells_per_page);
 
-        // Anchor cell first.
+        // Anchor cell first. `file_size` is the ORIGINAL input
+        // length so the decoder can validate the post-decompress
+        // output regardless of whether the bytes traveled
+        // compressed or not.
         let anchor = AnchorPayload {
             oti: oti_bytes,
             file_size: plaintext.len() as u64,
             total_pages: total_pages as u32,
             page_index: page_idx as u32,
+            compression,
         };
         cells.push(encode_anchor_cell(&anchor));
 
@@ -209,7 +247,7 @@ pub fn decode_pages(
     }
 
     // 2. First valid anchor wins; all subsequent anchors must
-    // agree on the OTI + file size.
+    // agree on the OTI + file size + compression flag.
     let mut anchor: Option<AnchorPayload> = None;
     for cell_bytes in &all_cells {
         if let Ok(DecodedCell::Anchor(payload)) = cell::decode_cell(cell_bytes) {
@@ -219,6 +257,7 @@ pub fn decode_pages(
                     if prev.oti != payload.oti
                         || prev.file_size != payload.file_size
                         || prev.total_pages != payload.total_pages
+                        || prev.compression != payload.compression
                     {
                         return Err(PageDecodeError::AnchorMismatch);
                     }
@@ -232,6 +271,7 @@ pub fn decode_pages(
     let oti = ObjectTransmissionInformation::deserialize(&anchor.oti);
     let mut decoder = Decoder::new(oti);
     let mut packet_buf = Vec::with_capacity(4 + SYMBOL_BYTES);
+    let mut rq_recovered: Option<Vec<u8>> = None;
     for cell_bytes in &all_cells {
         let Ok(DecodedCell::Data { payload_id, symbol }) = cell::decode_cell(cell_bytes) else {
             continue;
@@ -240,12 +280,28 @@ pub fn decode_pages(
         packet_buf.extend_from_slice(&payload_id);
         packet_buf.extend_from_slice(symbol);
         let packet = EncodingPacket::deserialize(&packet_buf);
-        if let Some(plaintext) = decoder.decode(packet) {
-            return Ok(plaintext);
+        if let Some(out) = decoder.decode(packet) {
+            rq_recovered = Some(out);
+            break;
         }
     }
+    let rq_recovered = rq_recovered.ok_or(PageDecodeError::NoSolution)?;
 
-    Err(PageDecodeError::NoSolution)
+    // 4. Decompress if needed, then validate the recovered length
+    // matches what the anchor claims.
+    let plaintext = match anchor.compression {
+        Compression::None => rq_recovered,
+        Compression::Zstd => zstd::decode_all(rq_recovered.as_slice())
+            .map_err(|e| PageDecodeError::DecompressionFailed(e.to_string()))?,
+    };
+    if plaintext.len() as u64 != anchor.file_size {
+        return Err(PageDecodeError::SizeMismatch {
+            expected: anchor.file_size,
+            actual: plaintext.len() as u64,
+        });
+    }
+
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -257,6 +313,20 @@ mod tests {
         // At RAPTORQ_MTU=124 → T=120 → ~120 bytes/cell, so one
         // page carries ~2.8 KB of source data.
         PageGeometry { nx: 5, ny: 5, pixels_per_dot: 1 }
+    }
+
+    /// Standard LCG (Numerical Recipes glibc parameters) producing
+    /// high-entropy bytes — zstd can't compress this below ~100%
+    /// of input size, so test page counts stay deterministic
+    /// regardless of compression layer state.
+    fn lcg_bytes(count: u32, seed: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..count)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (x >> 16) as u8
+            })
+            .collect()
     }
 
     #[test]
@@ -286,10 +356,13 @@ mod tests {
     #[test]
     fn round_trips_multi_page_payload() {
         let geom = medium_geometry();
-        // 8 KB payload — should span at least 3 pages at 5×5 cells.
-        let plaintext: Vec<u8> = (0u32..8192)
-            .map(|i| (i.wrapping_mul(13).wrapping_add(7) & 0xFF) as u8)
-            .collect();
+        // 8 KB high-entropy payload — should span at least 3 pages
+        // at 5×5 cells. Uses the standard LCG (period 2^32) so
+        // zstd can't compress the input below the multi-page
+        // threshold; tests with low-entropy inputs (e.g. cyclic
+        // mod-256 patterns) collapse to one page once compression
+        // is on.
+        let plaintext = lcg_bytes(8192, 0xCAFE_BABE);
         let pages = encode_pages(&plaintext, &geom, 10).unwrap();
         assert!(
             pages.len() >= 3,
@@ -329,10 +402,10 @@ mod tests {
         // Drop all but the first page from a multi-page encode.
         // With only ~24 packets surviving for a payload that needs
         // far more, decode should fail with NoSolution (not panic).
+        // High-entropy LCG so compression doesn't shrink it to a
+        // single page.
         let geom = medium_geometry();
-        let plaintext: Vec<u8> = (0u32..16_000)
-            .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
-            .collect();
+        let plaintext = lcg_bytes(16_000, 0xF00D_F00D);
         let pages = encode_pages(&plaintext, &geom, 5).unwrap();
         assert!(pages.len() > 2, "test setup: needs multi-page encode");
         let one_page = &pages[..1];

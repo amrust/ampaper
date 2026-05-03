@@ -64,6 +64,23 @@ getrandom = "0.4"
 # See docs/FORMAT-V3.md for how RaptorQ output maps onto cells.
 raptorq = "2"
 
+# v3 codec compression layer. Zstandard (RFC 8478) is the modern
+# replacement for bzip2 on the v1/v2 codec — near-LZMA ratios on
+# text, an order of magnitude faster decode, stable wire format
+# (won't change in 30 years). The encoder runs at level 22
+# (--ultra-22) for max ratio since paper-archive encoding is a
+# one-time cost. Compression is applied conditionally per file:
+# if zstd's output isn't smaller than the original, we ship raw
+# bytes and set the anchor's compression flag to None.
+#
+# `zstd` (this crate) is an FFI binding to the canonical libzstd
+# C library, statically linked from the bundled source. Pure-Rust
+# alternatives (`ruzstd` for decode, others for encode) exist but
+# are less mature; the FFI route is fine since zstd's wire format
+# is stable across implementations — any future pure-Rust port
+# will read what we encode here.
+zstd = "0.13"
+
 # Other deps (windows-rs for GDI / WIA / TWAIN at M9/M10) land
 # at the milestone that needs them. See docs/MILESTONES.md for
 # the staging order.

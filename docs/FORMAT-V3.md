@@ -3,15 +3,13 @@
 **Status:** Phase 1 (bytes-level codec) + Phase 2 (cell layer) +
 Phase 2.5 complete (corner finder patterns, offset + scale-drift
 tolerance, rotation correction via affine transform, Otsu
-adaptive thresholding, 5-point sub-pixel sampling). The codec is
-now ready for real print-and-scan experiments — synthetic round-
-trip tests cover offset, rotation, paper fade, bilinear
-interpolation, and additive noise both individually and combined.
-Phases 3+ (compression, encryption, density, modulation) are
-deferred to their respective milestones (see "Roadmap" below).
-The bytes-level, page-level, and Phase 2.5 page-bitmap wire
-formats defined here are stable; later phases extend them without
-breaking them.
+adaptive thresholding, 5-point sub-pixel sampling) + Phase 3a
+(zstd compression). The codec is ready for real print-and-scan
+experiments. Phase 3b (AES-256-GCM outer layer) and Phases 4+
+(density, modulation) are deferred to their respective
+milestones. The bytes-level, page-level, and Phase 2.5+3a
+wire formats defined here are stable; later phases extend them
+without breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -63,7 +61,8 @@ v3 addresses all three:
 | 2.5a   | QR-style corner finders + offset/scale-drift detection | n/a (still synthetic — but page can sit anywhere in a larger bitmap) |
 | 2.5b   | Rotation correction via affine transform from 3 finders + template-match filter | n/a (synthetic + rotated) |
 | 2.5c   | Otsu adaptive thresholding + 5-point sub-pixel sampling | 1.3-1.5× (real scanner ready) |
-| 3      | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
+| 3a     | zstd compression layer (level 22)                 | 3-5× more on text inputs         |
+| 3b     | AES-256-GCM outer layer (mirrors v2 posture)      | n/a (security)                    |
 | 4      | High dot density (250-300 dot/in)                 | ~3×                               |
 | 5      | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
 | 6      | CMYK 1-bit-per-channel (~3 effective bits/dot)    | ~8-9× best case                   |
@@ -210,10 +209,18 @@ payload area carries file-level metadata:
 | Offset (within payload) | Bytes | Field             |
 |-------------------------|-------|-------------------|
 | 0                       | 12    | RaptorQ OTI       |
-| 12                      | 8     | File size (u64 LE) |
+| 12                      | 8     | File size (u64 LE) — ORIGINAL uncompressed size |
 | 20                      | 4     | Total pages (u32 LE) |
 | 24                      | 4     | Page index (u32 LE)  |
-| 28                      | 92    | Reserved (zero in v1; future filename + mtime + attrs) |
+| 28                      | 1     | Compression algorithm (0 = None, 1 = Zstd) |
+| 29                      | 91    | Reserved (zero in v1; future filename + mtime + attrs) |
+
+`file_size` is the size of the ORIGINAL input file. When the
+compression byte is 1 (Zstd), the post-RaptorQ recovered byte
+stream is shorter than `file_size`; the decoder runs zstd
+decompression and validates the post-decompress length matches
+`file_size`. When the compression byte is 0 (None), the
+post-RaptorQ stream IS the file.
 
 Cell 0 of every page is an anchor. The decoder picks the first
 anchor it finds — anchors on subsequent pages are redundant
@@ -508,6 +515,83 @@ were found.
   actually printing a v3 page on paper, scanning it, and
   confirming the synthetic-test combo of distortions reflects
   reality.
+
+## Phase 3a: zstd compression
+
+This is the slice currently extending `src/v3/codec.rs` and
+`src/v3/cell.rs`. Adds a compression byte to the anchor cell
+and runs zstd over the source bytes before RaptorQ encoding.
+Picks the modern bzip2 successor as the default compressor for
+v3, gating the per-page density gain that closes most of the gap
+between PaperBack 1.10 + bzip2 and the v3 codec.
+
+### Why zstd, not bzip2
+
+Modern compressor landscape (representative ratios on War &
+Peace plain text, ~3.2 MB):
+
+| Codec | Compressed | Decode speed | Pure Rust available |
+|---|---|---|---|
+| no compression | 3.2 MB | — | — |
+| bzip2 | ~1.0 MB | slow | yes |
+| zstd-22 | ~840 KB | very fast | partial (FFI is mature) |
+| xz / LZMA2 | ~770 KB | medium | partial |
+| bzip3 | ~720 KB | medium | yes (newer format) |
+
+zstd is the modern default: best decode-speed-per-ratio of the
+mature options, format frozen as RFC 8478 (so any future zstd
+implementation will read what we encode here), and the
+established replacement for bzip2 in archival pipelines. xz has
+slightly better ratios but the wire format is more complex and
+the pure-Rust story is half-baked. bzip3 has the best text
+ratios but is newer (2022) and the ecosystem hasn't settled.
+
+### Compression decision
+
+For each input, the encoder runs zstd level 22 (`--ultra-22`)
+and uses the result ONLY if it's actually smaller than the raw
+input:
+
+```rust
+let compressed = zstd::encode_all(plaintext, 22)?;
+if compressed.len() < plaintext.len() {
+    // ship compressed
+    anchor.compression = Compression::Zstd;
+} else {
+    // ship raw, save zstd's ~14-byte frame overhead
+    anchor.compression = Compression::None;
+}
+```
+
+Already-compressed inputs (PDFs, JPEGs, ZIP archives) typically
+fall in the `None` bucket because zstd can't shrink already-
+random bytes and just adds the frame header. Text-like inputs
+fall in the `Zstd` bucket with 3-5× compression.
+
+### Wire format change
+
+Adding the compression byte to the anchor at offset 28 (within
+the cell payload area; offset 36 within the cell as a whole)
+shifted the previously-92-byte reserved tail to a 91-byte tail
+at offset 29. v3 has no installed paper base yet, so the
+incompatibility is academic — but worth pinning that this is
+the wire-format moment if paper does ship before Phase 3a.
+
+### Density at Phase 3a + current geometry
+
+GUI default: `pixels_per_dot=6`, `nx=26`, `ny=33` → 858 cells/page,
+857 data cells × 120 bytes/cell ÷ 1.25 (RaptorQ repair) = **80 KB
+raw payload per page**. With zstd at 3-5× on text:
+
+- Text-like input: **240-400 KB compressed-equivalent per page**
+- Already-compressed input: **80 KB per page** (compression
+  passed through unchanged)
+
+Comparison: PaperBack 1.10 at 200 dpi + bzip2 carries ~666 KB-1.1
+MB effective per page. The remaining gap closes at Phase 4 (200-
+dpi-equivalent dot density via `pixels_per_dot=3`), which lifts
+v3 to ~960 KB-1.6 MB compressed-equivalent per page,
+matching/beating mrpods.
 
 ## Channel asymmetry (Phase 6+ planning note)
 

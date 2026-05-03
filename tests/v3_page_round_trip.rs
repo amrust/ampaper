@@ -10,6 +10,21 @@
 
 use ampaper::v3::{PageBitmap, PageGeometry, decode_pages, encode_pages, pad_with_white};
 
+/// Standard LCG (Numerical Recipes glibc parameters) producing
+/// high-entropy bytes — defeats zstd's compression layer so
+/// per-page-count assertions in these tests stay deterministic.
+/// Without this, low-entropy input (e.g. a cyclic mod-256
+/// pattern) collapses to a single page after Phase 3 compression.
+fn lcg_bytes(count: u32, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..count)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (x >> 16) as u8
+        })
+        .collect()
+}
+
 fn letter_geometry() -> PageGeometry {
     // 12×18 cells = 216 cells/page. At RAPTORQ_MTU=124 → T=120, each
     // data cell carries ~120 bytes, so one page holds ~25 KB after
@@ -37,9 +52,10 @@ fn round_trips_short_payload_one_page() {
 
 #[test]
 fn round_trips_payload_that_spans_three_pages() {
-    let plaintext: Vec<u8> = (0u32..5000)
-        .map(|i| (i.wrapping_mul(13).wrapping_add(37) & 0xFF) as u8)
-        .collect();
+    // High-entropy input — zstd compression in encode_pages can't
+    // shrink LCG output below ~95% of original, so the page-count
+    // assertion stays valid.
+    let plaintext = lcg_bytes(5000, 0xDEAD_BEEF);
     let geom = small_geometry();
     let pages = encode_pages(&plaintext, &geom, 10).unwrap();
     assert!(
@@ -95,9 +111,7 @@ fn anchor_loss_on_first_pages_recovers_via_later_anchor() {
     // valid one it finds. This pins that property: corrupt the
     // anchors on the first half of the pages and confirm decode
     // still works using anchors from the surviving pages.
-    let plaintext: Vec<u8> = (0u32..4000)
-        .map(|i| (i.wrapping_mul(17) & 0xFF) as u8)
-        .collect();
+    let plaintext = lcg_bytes(4000, 0xC0DE_C0DE);
     let geom = small_geometry();
     let mut pages = encode_pages(&plaintext, &geom, 30).unwrap();
     assert!(pages.len() >= 4, "test setup needs ≥ 4 pages");
@@ -128,9 +142,7 @@ fn dropped_pages_recover_via_rateless_ecc() {
     // carry enough RaptorQ packets (source + repair) for the
     // decoder to converge. Pins the rateless-ECC promise at the
     // page level.
-    let plaintext: Vec<u8> = (0u32..3000)
-        .map(|i| (i.wrapping_mul(23) & 0xFF) as u8)
-        .collect();
+    let plaintext = lcg_bytes(3000, 0xBEEF_BEEF);
     let geom = small_geometry();
     let pages = encode_pages(&plaintext, &geom, 30).unwrap();
     assert!(pages.len() >= 3, "test setup needs ≥ 3 pages");
@@ -139,6 +151,59 @@ fn dropped_pages_recover_via_rateless_ecc() {
     let _dropped = survivors.remove(1);
 
     let recovered = decode_pages(&survivors, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn highly_compressible_payload_fits_on_one_page() {
+    // The Phase 3 compression payoff: 100 KB of repetitive text
+    // would normally span ~5 pages at small_geometry without
+    // compression. With zstd at level 22 the bytes shrink by ~50×
+    // and the encoded output fits on a single page. Pins the
+    // encoder's "use compression when it helps" decision.
+    let mut plaintext = Vec::with_capacity(100_000);
+    let line = b"PaperBack 1.10 archives bytes onto paper. ampaper v3 picks up where it left off. ";
+    while plaintext.len() < 100_000 {
+        plaintext.extend_from_slice(line);
+    }
+    plaintext.truncate(100_000);
+
+    let geom = small_geometry();
+    let pages = encode_pages(&plaintext, &geom, 5).unwrap();
+    assert_eq!(
+        pages.len(),
+        1,
+        "100 KB of repetitive text should compress to <1 page, got {}",
+        pages.len()
+    );
+    let recovered = decode_pages(&pages, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
+fn already_compressed_input_falls_back_to_raw() {
+    // Truly random / high-entropy input that zstd can't shrink.
+    // The encoder must detect this case and store raw bytes
+    // (compression flag = None on the anchor) rather than waste
+    // ~14 bytes of zstd frame overhead per page. Page count
+    // should match the raw-encoding count.
+    let plaintext = lcg_bytes(2000, 0xABBA_ABBA);
+    let geom = small_geometry();
+    let pages = encode_pages(&plaintext, &geom, 5).unwrap();
+
+    // Decode anchor of page 0 to confirm compression == None.
+    let cells = ampaper::v3::page::parse_page(&pages[0], &geom).unwrap();
+    let anchor = match ampaper::v3::cell::decode_cell(&cells[0]).unwrap() {
+        ampaper::v3::cell::DecodedCell::Anchor(a) => a,
+        _ => panic!("cell 0 must be an anchor"),
+    };
+    assert_eq!(
+        anchor.compression,
+        ampaper::v3::cell::Compression::None,
+        "incompressible input should ship raw, not pay zstd's overhead"
+    );
+
+    let recovered = decode_pages(&pages, &geom).unwrap();
     assert_eq!(recovered, plaintext);
 }
 

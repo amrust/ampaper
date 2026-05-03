@@ -95,6 +95,32 @@ pub enum DecodedCell<'a> {
     Anchor(AnchorPayload),
 }
 
+/// Compression algorithm applied to the source bytes before
+/// RaptorQ encoding. The decoder uses this to pick the right
+/// decompressor on the post-RaptorQ output. New variants get
+/// new byte values and refuse to decode on old readers — that's
+/// fine; v3 is greenfield and the legacy v1/v2 paths are
+/// untouched, so backward compatibility burdens stay zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    /// Raw bytes, no compression. Used when zstd's output isn't
+    /// smaller than the original (already-compressed inputs like
+    /// PDFs and JPEGs typically fall in this bucket).
+    None = 0,
+    /// Zstandard (RFC 8478). Phase 3 default.
+    Zstd = 1,
+}
+
+impl Compression {
+    fn from_byte(b: u8) -> Result<Self, CellError> {
+        match b {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Zstd),
+            other => Err(CellError::UnknownCompression { byte: other }),
+        }
+    }
+}
+
 /// Anchor cell payload — file-level metadata that lets a decoder
 /// verify it has all the pages and reconstruct the RaptorQ
 /// configuration. Fits inside the 120-byte cell payload area.
@@ -102,19 +128,26 @@ pub enum DecodedCell<'a> {
 /// Layout (relative to the start of the cell payload, byte 8 of
 /// the cell):
 ///
-/// | Offset | Bytes | Field          |
-/// |--------|-------|----------------|
-/// | 0      | 12    | RaptorQ OTI    |
-/// | 12     | 8     | File size (LE) |
-/// | 20     | 4     | Total pages (LE) |
-/// | 24     | 4     | Page index (LE)  |
-/// | 28     | 92    | Reserved (zero in version 1; future filename + mtime + attrs) |
+/// | Offset | Bytes | Field                                       |
+/// |--------|-------|---------------------------------------------|
+/// | 0      | 12    | RaptorQ OTI                                 |
+/// | 12     | 8     | File size (LE) — ORIGINAL uncompressed size |
+/// | 20     | 4     | Total pages (LE)                            |
+/// | 24     | 4     | Page index (LE)                             |
+/// | 28     | 1     | Compression algorithm byte (see [`Compression`]) |
+/// | 29     | 91    | Reserved (zero in version 1; future filename + mtime + attrs) |
+///
+/// `file_size` is the size of the ORIGINAL input; the post-
+/// RaptorQ recovered byte stream may be smaller (when compressed)
+/// or equal (when raw). The decoder uses `file_size` to validate
+/// the post-decompression output length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnchorPayload {
     pub oti: [u8; 12],
     pub file_size: u64,
     pub total_pages: u32,
     pub page_index: u32,
+    pub compression: Compression,
 }
 
 /// Cell decode failure. The scan path drops failed cells and asks
@@ -128,6 +161,11 @@ pub enum CellError {
     NonZeroReserved,
     BadAnchorMagic,
     AnchorReservedNonZero,
+    /// Anchor cell's compression-algorithm byte names a value
+    /// this decoder doesn't know how to handle. Most likely the
+    /// file was produced by a future ampaper version that added
+    /// a new compression algorithm (e.g. xz, brotli).
+    UnknownCompression { byte: u8 },
 }
 
 impl core::fmt::Display for CellError {
@@ -142,6 +180,10 @@ impl core::fmt::Display for CellError {
             Self::AnchorReservedNonZero => {
                 f.write_str("anchor cell reserved bytes must be zero in version 1")
             }
+            Self::UnknownCompression { byte } => write!(
+                f,
+                "unknown anchor compression byte 0x{byte:02x} — file was produced by a newer ampaper version?"
+            ),
         }
     }
 }
@@ -178,7 +220,8 @@ pub fn encode_anchor_cell(anchor: &AnchorPayload) -> [u8; CELL_BYTES] {
         .copy_from_slice(&anchor.total_pages.to_le_bytes());
     cell[OFF_PAYLOAD + 24..OFF_PAYLOAD + 28]
         .copy_from_slice(&anchor.page_index.to_le_bytes());
-    // Bytes OFF_PAYLOAD+28..128 are reserved, already zero.
+    cell[OFF_PAYLOAD + 28] = anchor.compression as u8;
+    // Bytes OFF_PAYLOAD+29..128 are reserved, already zero.
     let crc = cell_crc(&cell[OFF_TYPE..]);
     cell[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_le_bytes());
     cell
@@ -217,9 +260,10 @@ pub fn decode_cell(cell: &[u8; CELL_BYTES]) -> Result<DecodedCell<'_>, CellError
             total_b.copy_from_slice(&cell[OFF_PAYLOAD + 20..OFF_PAYLOAD + 24]);
             let mut idx_b = [0u8; 4];
             idx_b.copy_from_slice(&cell[OFF_PAYLOAD + 24..OFF_PAYLOAD + 28]);
+            let compression = Compression::from_byte(cell[OFF_PAYLOAD + 28])?;
             // Reject anchor cells whose reserved tail isn't zero —
             // future versions will use it, current version mustn't.
-            if cell[OFF_PAYLOAD + 28..].iter().any(|&b| b != 0) {
+            if cell[OFF_PAYLOAD + 29..].iter().any(|&b| b != 0) {
                 return Err(CellError::AnchorReservedNonZero);
             }
             Ok(DecodedCell::Anchor(AnchorPayload {
@@ -227,6 +271,7 @@ pub fn decode_cell(cell: &[u8; CELL_BYTES]) -> Result<DecodedCell<'_>, CellError
                 file_size: u64::from_le_bytes(file_size_b),
                 total_pages: u32::from_le_bytes(total_b),
                 page_index: u32::from_le_bytes(idx_b),
+                compression,
             }))
         }
         other => Err(CellError::UnknownType { type_byte: other }),
@@ -259,6 +304,7 @@ mod tests {
             file_size: 0xDEAD_BEEF_1234,
             total_pages: 42,
             page_index: 7,
+            compression: Compression::Zstd,
         };
         let cell = encode_anchor_cell(&anchor);
         let decoded = decode_cell(&cell).unwrap();
@@ -296,6 +342,7 @@ mod tests {
             file_size: 0,
             total_pages: 1,
             page_index: 0,
+            compression: Compression::None,
         };
         let mut cell = encode_anchor_cell(&anchor);
         // Set a reserved byte to 1 and re-CRC.
