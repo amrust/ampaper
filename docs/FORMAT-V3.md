@@ -1,9 +1,12 @@
 # ampaper v3 — wire format spec
 
-**Status:** Phase 1 (M12), bytes-level slice. Cell layout, finder
-patterns, and bitmap rendering are deferred to subsequent phases
-(see "Roadmap" below). The bytes-level wire format defined here is
-stable; later phases extend it without breaking it.
+**Status:** Phase 1 (bytes-level codec) + Phase 2 first slice (cell
++ page-bitmap layer, synthetic round-trip). Finder patterns and
+real-scanner registration are still deferred to Phase 2.5; phases
+3+ (compression, encryption, density, modulation) are deferred to
+their respective milestones (see "Roadmap" below). Both the
+bytes-level and the page-level wire formats defined here are stable;
+later phases extend them without breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -51,7 +54,8 @@ v3 addresses all three:
 | Phase | Adds                                              | Target density vs v1 at 100 dot/in |
 |-------|---------------------------------------------------|-----------------------------------|
 | 1     | Bytes-level RaptorQ codec, magic + OTI header     | n/a (no bitmap layer yet)         |
-| 2     | Cell layout, finder patterns, single anchor block | 1.3-1.5×                          |
+| 2.0   | Cell layout, page bitmap render/parse, anchor block | n/a (synthetic round-trip)      |
+| 2.5   | QR-style finder patterns + scan-side registration | 1.3-1.5×                          |
 | 3     | zstd-long compression + AES-256-GCM outer layer   | 1.3-1.5× (compression-dependent)  |
 | 4     | High dot density (250-300 dot/in)                 | ~3×                               |
 | 5     | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
@@ -144,6 +148,98 @@ revisited in Phase 2 against measured scanner loss profiles.
 | Compression           | bzip2 (optional)     | bzip2 (optional)         | zstd (Phase 3)        |
 | Encryption            | AES-192-CBC (read)   | AES-256-GCM              | AES-256-GCM (Phase 3) |
 | Per-page wasted cells | up to 6              | up to 6                  | 0                     |
+
+## Phase 2 first slice: cell + page-bitmap layer
+
+This is the slice currently implemented in `src/v3/cell.rs`,
+`src/v3/page.rs`, and `src/v3/codec.rs`. It packages the
+Phase 1 bytes-level codec into 32×32-dot cells, lays them out as
+a `nx × ny` grid on a page, and renders the grid to an 8-bit
+grayscale bitmap. The decoder reverses the process from a
+pixel-perfect bitmap (real-scanner tolerance is Phase 2.5).
+
+### Cell layout
+
+Each cell is a fixed 128 bytes that round-trips through a 32×32
+dot pattern. Bit packing is MSB-first row-major: byte 0 holds
+dots (0,0)..(0,7) — top row, leftmost 8 dots, with bit 7 of
+byte 0 = dot (0,0).
+
+| Offset | Bytes | Field                                  |
+|--------|-------|----------------------------------------|
+| 0      | 2     | CRC-16 over bytes 2..128, XORed with `0x7633` |
+| 2      | 1     | Cell type (`0x00` data, `0x01` anchor) |
+| 3      | 1     | Reserved (must be zero)                |
+| 4      | 4     | Discriminator (payload-ID for data, `b"ANCR"` for anchor) |
+| 8      | 120   | Payload                                |
+
+The CRC XOR mask `0x7633` (= ASCII `"v3"`) serves two roles:
+
+1. **Domain separation from blank paper.** ampaper's `crc16` is
+   CRC-16/XMODEM (init 0). Without an XOR mask, an all-zero cell
+   stores stored_crc = 0, computed_crc = 0, and validates as a
+   data cell with payload-ID `[0,0,0,0]`. RaptorQ would receive
+   that as a fake packet. The XOR pushes blank cells out of the
+   valid-CRC space.
+2. **Domain separation from v1.** PB 1.10's blocks XOR their CRC
+   with `0x55AA`. Choosing a different constant for v3 means a
+   v1 cell can never accidentally satisfy a v3 reader's CRC and
+   vice versa, even on otherwise-identical bytes.
+
+### Data cells
+
+For data cells, the discriminator at bytes 4..8 is the RaptorQ
+payload ID (1-byte SBN + 3-byte ESI per RFC 6330 §3.2). The 120
+payload bytes at 8..128 are the RaptorQ symbol — symbol size T =
+120 falls out of `RAPTORQ_MTU = 124` (4 bytes payload-ID + 120
+bytes symbol on the wire) once the encoder applies the default
+8-byte alignment.
+
+### Anchor cells
+
+For anchor cells, the discriminator is `b"ANCR"`. The 120-byte
+payload area carries file-level metadata:
+
+| Offset (within payload) | Bytes | Field             |
+|-------------------------|-------|-------------------|
+| 0                       | 12    | RaptorQ OTI       |
+| 12                      | 8     | File size (u64 LE) |
+| 20                      | 4     | Total pages (u32 LE) |
+| 24                      | 4     | Page index (u32 LE)  |
+| 28                      | 92    | Reserved (zero in v1; future filename + mtime + attrs) |
+
+Cell 0 of every page is an anchor. The decoder picks the first
+anchor it finds — anchors on subsequent pages are redundant
+copies, useful when a corner of one page is destroyed. Anchors
+across the same encoded file's pages MUST agree on OTI + file
+size + total page count; disagreement is a hard decode error.
+
+### Page layout
+
+A page's cells are laid out row-major in a `nx × ny` grid. Cell
+index `i` lives at column `i % nx`, row `i / nx`. The bitmap is
+`(nx · 32 · pixels_per_dot) × (ny · 32 · pixels_per_dot)` 8-bit
+grayscale pixels. `pixels_per_dot` is the printer-pixel scale
+(1 = unscaled, 6 = PB-1.10's 600-DPI × 100-dot/in calibration).
+
+Cell 0 is the anchor. Cells 1..nx·ny carry RaptorQ packets. The
+encoder fills pages sequentially: page 0 carries the first
+`nx·ny - 1` packets, page 1 the next slice, etc. The last page
+may have trailing all-zero cells (which fail the CRC and are
+skipped by the decoder).
+
+### Phase 2.5 will add
+
+- QR-style finder patterns at the four page corners. Lets a
+  scan-side decoder find the page boundary and correct skew /
+  rotation before sampling cell pixels.
+- Edge timing tracks (alternating black/white dots along the top
+  and left margins) for cell-grid registration. Replaces the
+  current "decoder must know the geometry exactly" assumption.
+- Threshold + dot-center sampling that tolerates real scanner
+  noise, ink bleed, and cheap-CCD blur. The current parser
+  samples the geometric center of each dot's pixel block, which
+  is fine for synthetic bitmaps but not yet for paper.
 
 ## Channel asymmetry (Phase 6+ planning note)
 

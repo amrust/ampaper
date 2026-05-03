@@ -34,9 +34,16 @@
 // extends the spec with backward-incompatible bumps to the version
 // byte; v3 decoders MUST reject unknown versions.
 
+pub mod cell;
+pub mod codec;
 pub mod decoder;
 pub mod encoder;
 pub mod format;
+pub mod page;
 
+pub use codec::{
+    PageDecodeError, PageEncodeError, decode_pages, encode_pages,
+};
 pub use decoder::{DecodeError, decode};
 pub use encoder::{EncodeError, EncodeOptions, encode};
+pub use page::{PageBitmap, PageGeometry};
