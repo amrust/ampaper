@@ -114,6 +114,54 @@ fn highly_compressible_payload_fits_on_one_page() {
 }
 
 #[test]
+fn auto_detect_survives_channel_attenuation() {
+    // Real-paper failure mode: the C/M/Y channels each pick up
+    // different amounts of scanner noise + ink-color drift, so
+    // any SINGLE decomposed channel may have finders too faded
+    // for the run-length detector. The luma composite (which
+    // sees all three channels combined) keeps finder pixels at
+    // composite-black even when individual channels drift.
+    //
+    // Simulate a real-scan-like situation: every pixel of the
+    // bitmap gets per-channel attenuation (cyan dimmed 20%,
+    // magenta dimmed 35%, yellow dimmed 50%) while keeping
+    // composite-black finder pixels black. Auto-detect via luma
+    // should still locate finders; auto-detect via single
+    // channel (the previous implementation) wouldn't.
+    use ampaper::v3::decode_pages_cmyk_auto;
+
+    let plaintext = b"luma-based finder detection survives channel asymmetry";
+    let pages = encode_pages_cmyk(plaintext, &small_geometry(), 25).unwrap();
+
+    // Apply channel-asymmetric attenuation per pixel. Composite-
+    // black pixels (R=G=B=0) stay black; pure-color pixels get
+    // shifted toward gray.
+    let attenuated: Vec<RgbPageBitmap> = pages
+        .iter()
+        .map(|rgb| {
+            let mut pixels = rgb.pixels.clone();
+            for chunk in pixels.chunks_mut(3) {
+                // Each non-black pixel gets nudged toward gray
+                // by per-channel amount. The closer to white the
+                // input, the more shift it sees.
+                let r_new = (chunk[0] as u32 * 80 + 200 * (255 - chunk[0]) as u32 / 255) / 100;
+                let g_new = (chunk[1] as u32 * 65 + 200 * (255 - chunk[1]) as u32 / 255) / 100;
+                let b_new = (chunk[2] as u32 * 50 + 200 * (255 - chunk[2]) as u32 / 255) / 100;
+                chunk[0] = r_new.min(255) as u8;
+                chunk[1] = g_new.min(255) as u8;
+                chunk[2] = b_new.min(255) as u8;
+            }
+            RgbPageBitmap { pixels, width: rgb.width, height: rgb.height }
+        })
+        .collect();
+
+    let recovered = decode_pages_cmyk_auto(&attenuated).unwrap_or_else(|e| {
+        panic!("luma-based auto-detect must survive channel attenuation: {e}")
+    });
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
 fn yellow_channel_loss_recovers_via_pooled_packets() {
     // Phase 6's resilience promise: each color channel carries a
     // disjoint set of RaptorQ packets, but the decoder pools them

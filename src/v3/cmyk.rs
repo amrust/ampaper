@@ -286,19 +286,55 @@ pub fn encode_pages_cmyk(
     Ok(rgb_pages)
 }
 
+/// Convert an RGB page bitmap to an 8-bit luma bitmap using
+/// ITU-R BT.601 weights. Used by [`decode_pages_cmyk_auto`] for
+/// finder detection — the luma view is dramatically more robust
+/// to real-scan noise than any single decomposed channel: the
+/// finder pattern is drawn in all 3 channels (composite black,
+/// luma ≈ 0) while data cells contain at most 2 channels of
+/// single-color ink (cyan-only luma ≈ 178, magenta-only ≈ 95,
+/// yellow-only ≈ 224, etc.), so the contrast between finder
+/// pixels and data pixels in luma space is much larger than
+/// the single-bit contrast in any decomposed channel.
+fn rgb_to_luma_bitmap(rgb: &RgbPageBitmap) -> PageBitmap {
+    let n = (rgb.width as usize) * (rgb.height as usize);
+    let mut pixels = vec![0u8; n];
+    for (i, p) in pixels.iter_mut().enumerate() {
+        let r = rgb.pixels[i * 3] as u32;
+        let g = rgb.pixels[i * 3 + 1] as u32;
+        let b = rgb.pixels[i * 3 + 2] as u32;
+        let l = (299 * r + 587 * g + 114 * b) / 1000;
+        *p = l.min(255) as u8;
+    }
+    PageBitmap {
+        pixels,
+        width: rgb.width,
+        height: rgb.height,
+    }
+}
+
 /// Decode CMY page bitmaps back to plaintext, auto-detecting
 /// `nx`/`ny`/`pixels_per_dot` from the first page's finder
-/// positions (decomposed cyan layer). Use this when the
-/// geometry isn't known to the caller.
+/// positions. Use this when the geometry isn't known to the
+/// caller.
+///
+/// Detection runs on the LUMA composite of the RGB page (not on
+/// any single decomposed channel). The finder pattern is drawn
+/// in all 3 channels — composite-black on every dot — so it
+/// shows up as full-black (luma ≈ 0) in the luma view, while
+/// data cells with single-color ink (cyan, magenta, yellow) read
+/// as much lighter luma values (95-224). The contrast is far
+/// larger than any single channel can produce. Caught from a
+/// real-paper test where the C-layer-only detection failed at
+/// "only 2 finder patterns detected" on a scanned print —
+/// luma-based detection survives the channel-asymmetric noise
+/// real scanners introduce.
 pub fn decode_pages_cmyk_auto(pages: &[RgbPageBitmap]) -> Result<Vec<u8>, CmyDecodeError> {
     if pages.is_empty() {
         return Err(CmyDecodeError::NoAnchorFound);
     }
-    // Decompose the first page; finder detection on the C layer
-    // suffices because all 3 channels carry the same finder
-    // pattern (they get rendered as composite-black corners).
-    let (c_layer, _, _) = decompose_cmy(&pages[0]);
-    let detected = super::finder::detect_geometry(&c_layer)
+    let luma = rgb_to_luma_bitmap(&pages[0]);
+    let detected = super::finder::detect_geometry(&luma)
         .map_err(|e| CmyDecodeError::PageParse(super::page::ParseError::FinderDetection(e)))?;
     let geom = PageGeometry {
         nx: detected.nx,
