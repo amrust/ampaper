@@ -174,7 +174,14 @@ pub struct DecodePage {
     /// Source path (for display in the result list).
     pub source: PathBuf,
     /// Grayscale 8-bit bitmap, row-major. `luma.len() == width * height`.
+    /// Used by the legacy v1/v2 decoder and the v3 B&W decoder.
     pub luma: Vec<u8>,
+    /// RGB 8-bit bitmap, row-major, 3 bytes per pixel (R, G, B).
+    /// `rgb.len() == width * height * 3`. Used by the v3 CMY decoder.
+    /// Always populated for PDF-rendered pages; image-loaded inputs
+    /// derive RGB from luma (R = G = B = luma) so non-color sources
+    /// route to the grayscale paths cleanly.
+    pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
@@ -271,18 +278,25 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
         return Err("no input pages".into());
     }
 
-    // Sniff for v3 first: try to detect QR-style corner finders on
-    // the first page. If they're there, this is a v3 PDF — route
-    // to the v3 decoder instead of the legacy scan path. Legacy
-    // scan_decode would just emit "no SuperBlock decoded" on a v3
-    // page, since v3 has no PB-1.10-style SuperBlock.
+    // Dispatch by codec, in order:
+    //   1. v3 CMY (color) — sniff for color content in the rendered
+    //      RGB. Routes to ampaper::v3::decode_pages_cmyk.
+    //   2. v3 B&W — sniff for QR-style corner finders. Routes to
+    //      ampaper::v3::decode_pages.
+    //   3. Legacy v1/v2 — fallback. Existing scan_decode path.
+    // Legacy classification is skipped for v3 pages (it'd show
+    // all-red because v3 cells aren't PB-1.10 cells); a v3-
+    // specific cell classification is a future polish item.
+    if has_color(&req.pages[0]) {
+        send(DecodeMessage::Status(
+            "v3 CMY codec detected — decoding via RaptorQ + 3-channel pool".into(),
+        ));
+        return run_v3_cmy_decode(req);
+    }
     if sniff_v3(&req.pages[0]) {
         send(DecodeMessage::Status(
-            "v3 codec detected — decoding via RaptorQ".into(),
+            "v3 B&W codec detected — decoding via RaptorQ".into(),
         ));
-        // Skip the legacy per-cell classification pass for v3 pages
-        // (it'd show all-red because v3 cells aren't PB-1.10 cells).
-        // Future slice will add v3-specific cell classification.
         return run_v3_decode(req);
     }
 
@@ -368,6 +382,62 @@ fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
         })
         .collect();
     decode_pages(&pages, &geom).map_err(|e| format!("v3 decode: {e}"))
+}
+
+/// Sample pixels across the page; report whether any have
+/// asymmetric R/G/B beyond a small noise tolerance. PDFs produced
+/// by the legacy v1/v2 codec or the v3 B&W codec render to
+/// near-grayscale (R == G == B per pixel), while v3 CMY pages
+/// have characteristic cyan/magenta/yellow ink colors. Sampling
+/// every Nth pixel is enough — a v3 CMY page has thousands of
+/// non-grayscale pixels, vs zero on a B&W rendered PDF.
+fn has_color(page: &DecodePage) -> bool {
+    if page.rgb.len() != (page.width as usize) * (page.height as usize) * 3 {
+        return false;
+    }
+    let n = (page.width as usize) * (page.height as usize);
+    if n == 0 {
+        return false;
+    }
+    // Tolerance: ±16 across channels accounts for PDF rasteriser
+    // dithering and JPEG-style compression that pdfium might do
+    // on B&W images. Real CMY content has ink colors with
+    // 200+-spread between max and min channels per pixel.
+    let tol: i32 = 16;
+    let stride = (n / 1000).max(1); // ~1000 sample points per page
+    let mut color_count = 0u32;
+    let mut checked = 0u32;
+    let mut i = 0usize;
+    while i < n {
+        let r = page.rgb[i * 3] as i32;
+        let g = page.rgb[i * 3 + 1] as i32;
+        let b = page.rgb[i * 3 + 2] as i32;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        if max - min > tol {
+            color_count += 1;
+        }
+        checked += 1;
+        i += stride;
+    }
+    // ≥ 5% of sampled pixels show color → CMY input.
+    color_count * 20 > checked
+}
+
+fn run_v3_cmy_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
+    use ampaper::v3::{PageGeometry, RgbPageBitmap, decode_pages_cmyk};
+
+    let geom = PageGeometry { nx: 52, ny: 68, pixels_per_dot: 3 };
+    let pages: Vec<RgbPageBitmap> = req
+        .pages
+        .iter()
+        .map(|p| RgbPageBitmap {
+            pixels: p.rgb.clone(),
+            width: p.width,
+            height: p.height,
+        })
+        .collect();
+    decode_pages_cmyk(&pages, &geom).map_err(|e| format!("v3 CMY decode: {e}"))
 }
 
 /// Run scan_extract over a single page and bucket each resulting
@@ -654,10 +724,12 @@ pub fn render_pdf_pages(pdf_path: &std::path::Path, dpi: u32) -> Result<Vec<Deco
             .as_image()
             .map_err(|e| format!("PDFium bitmap → image conversion failed: {e}"))?;
         let luma = dyn_image.to_luma8();
+        let rgb = dyn_image.to_rgb8();
         let (w, h) = luma.dimensions();
         out.push(DecodePage {
             source: pdf_path.to_path_buf(),
             luma: luma.into_raw(),
+            rgb: rgb.into_raw(),
             width: w,
             height: h,
         });

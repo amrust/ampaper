@@ -128,10 +128,13 @@ fn worker_v1_decode_round_trips_clean_bitmap_and_recovers_filename() {
 
     let img = image::open(&bmp_path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
+    let luma_bytes = img.into_raw();
+    let rgb_bytes: Vec<u8> = luma_bytes.iter().flat_map(|&l| [l, l, l]).collect();
     let req = DecodeRequest {
         pages: vec![DecodePage {
             source: bmp_path.clone(),
-            luma: img.into_raw(),
+            luma: luma_bytes,
+            rgb: rgb_bytes,
             width: w,
             height: h,
         }],
@@ -189,10 +192,13 @@ fn worker_v2_decode_round_trips_with_password() {
 
     let img = image::open(&bmp_path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
+    let luma_bytes = img.into_raw();
+    let rgb_bytes: Vec<u8> = luma_bytes.iter().flat_map(|&l| [l, l, l]).collect();
     let req = DecodeRequest {
         pages: vec![DecodePage {
             source: bmp_path,
-            luma: img.into_raw(),
+            luma: luma_bytes,
+            rgb: rgb_bytes,
             width: w,
             height: h,
         }],
@@ -235,10 +241,13 @@ fn worker_recovers_filename_from_real_paperbak_1_10_bmp() {
 
     let img = image::open(&bmp_path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
+    let luma_bytes = img.into_raw();
+    let rgb_bytes: Vec<u8> = luma_bytes.iter().flat_map(|&l| [l, l, l]).collect();
     let req = DecodeRequest {
         pages: vec![DecodePage {
             source: bmp_path,
-            luma: img.into_raw(),
+            luma: luma_bytes,
+            rgb: rgb_bytes,
             width: w,
             height: h,
         }],
@@ -296,10 +305,13 @@ fn worker_v2_decode_with_wrong_password_fails_cleanly() {
 
     let img = image::open(&bmp_path).unwrap().to_luma8();
     let (w, h) = img.dimensions();
+    let luma_bytes = img.into_raw();
+    let rgb_bytes: Vec<u8> = luma_bytes.iter().flat_map(|&l| [l, l, l]).collect();
     let req = DecodeRequest {
         pages: vec![DecodePage {
             source: bmp_path,
-            luma: img.into_raw(),
+            luma: luma_bytes,
+            rgb: rgb_bytes,
             width: w,
             height: h,
         }],

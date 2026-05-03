@@ -692,6 +692,147 @@ pub fn save_pages_as_pdf(
     Ok(())
 }
 
+/// Write RGB page bitmaps out as a multi-page PDF — the
+/// color-mode equivalent of [`save_pages_as_pdf`]. Used by the
+/// Print tab's v3 CMY codec path; embeds each page bitmap as an
+/// 8-bit-per-channel RGB image (3 bytes/pixel) into the PDF.
+///
+/// Layout, header placement, and page sizing mirror the grayscale
+/// path so users get the same look on output regardless of which
+/// codec they picked.
+pub fn save_rgb_pages_as_pdf(
+    pages: &[ampaper::v3::RgbPageBitmap],
+    dpi: u32,
+    header: Option<&PdfHeader>,
+    doc_name: &str,
+    path: &Path,
+) -> Result<(), PrintError> {
+    use printpdf::{
+        BuiltinFont, ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument,
+        PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, RawImage, RawImageData,
+        RawImageFormat, TextItem, XObjectTransform,
+    };
+
+    if pages.is_empty() {
+        return Err(PrintError::Io {
+            path: path.display().to_string(),
+            message: "no pages to write".into(),
+        });
+    }
+    if dpi == 0 {
+        return Err(PrintError::Io {
+            path: path.display().to_string(),
+            message: "DPI must be > 0".into(),
+        });
+    }
+
+    let mut doc = PdfDocument::new(doc_name);
+
+    const LETTER_WIDTH_PT: f32 = 612.0;
+    const LETTER_HEIGHT_PT: f32 = 792.0;
+    const PAGE_MARGIN_PT: f32 = 36.0;
+    const HEADER_FONT_SIZE_PT: f32 = 10.0;
+    const HEADER_GAP_PT: f32 = 6.0;
+    let mut pdf_pages = Vec::with_capacity(pages.len());
+
+    let helvetica = PdfFontHandle::Builtin(BuiltinFont::Helvetica);
+
+    for (i, page) in pages.iter().enumerate() {
+        let raw = RawImage {
+            width: page.width as usize,
+            height: page.height as usize,
+            data_format: RawImageFormat::RGB8,
+            pixels: RawImageData::U8(page.pixels.clone()),
+            tag: Vec::new(),
+        };
+        let image_id = doc.add_image(&raw);
+
+        let img_width_pt = page.width as f32 * 72.0 / dpi as f32;
+        let img_height_pt = page.height as f32 * 72.0 / dpi as f32;
+
+        let use_letter_page = header.is_some()
+            || (img_width_pt <= LETTER_WIDTH_PT && img_height_pt <= LETTER_HEIGHT_PT);
+        let (page_width_pt, page_height_pt) = if use_letter_page {
+            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
+        } else {
+            (img_width_pt, img_height_pt)
+        };
+
+        let header_band_pt = if header.is_some() {
+            HEADER_FONT_SIZE_PT + HEADER_GAP_PT
+        } else {
+            0.0
+        };
+        let img_x_pt = ((page_width_pt - img_width_pt) / 2.0).max(0.0);
+        let img_top_pt = page_height_pt - PAGE_MARGIN_PT - header_band_pt;
+        let img_bottom_pt = img_top_pt - img_height_pt;
+        let img_y_pt = img_bottom_pt.max(0.0);
+
+        let mut ops = Vec::new();
+
+        if let Some(h) = header {
+            let header_text = format_header_text(h, i, pages.len());
+            let header_baseline_y_pt = page_height_pt - PAGE_MARGIN_PT;
+            let header_x_pt = PAGE_MARGIN_PT;
+            ops.extend([
+                Op::StartTextSection,
+                Op::SetFont {
+                    font: helvetica.clone(),
+                    size: Pt(HEADER_FONT_SIZE_PT),
+                },
+                Op::SetTextCursor {
+                    pos: Point {
+                        x: Pt(header_x_pt),
+                        y: Pt(header_baseline_y_pt),
+                    },
+                },
+                Op::ShowText {
+                    items: vec![TextItem::Text(header_text)],
+                },
+                Op::EndTextSection,
+            ]);
+        }
+
+        ops.push(Op::UseXobject {
+            id: image_id,
+            transform: XObjectTransform {
+                translate_x: Some(Pt(img_x_pt)),
+                translate_y: Some(Pt(img_y_pt)),
+                dpi: Some(dpi as f32),
+                ..Default::default()
+            },
+        });
+
+        let width_mm = page_width_pt * 25.4 / 72.0;
+        let height_mm = page_height_pt * 25.4 / 72.0;
+        pdf_pages.push(PdfPage::new(Mm(width_mm), Mm(height_mm), ops));
+    }
+
+    doc.with_pages(pdf_pages);
+
+    // Same Flate compression as the grayscale path. CMY page bitmaps
+    // are mostly white with sparse colored dots — Flate squeezes
+    // them comparably well.
+    let opts = PdfSaveOptions {
+        image_optimization: Some(ImageOptimizationOptions {
+            format: Some(ImageCompression::Flate),
+            quality: None,
+            max_image_size: None,
+            dither_greyscale: None,
+            convert_to_greyscale: None,
+            auto_optimize: Some(false),
+        }),
+        ..Default::default()
+    };
+    let mut warnings = Vec::new();
+    let bytes = doc.save(&opts, &mut warnings);
+    std::fs::write(path, bytes).map_err(|e| PrintError::Io {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
 #[cfg(windows)]
 mod win32 {
     use super::{PrintError, PrintPage};

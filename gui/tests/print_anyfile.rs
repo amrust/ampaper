@@ -132,6 +132,7 @@ fn print_tab_encodes_raw_file_on_the_fly_and_round_trips_via_pdf() {
         .map(|p| DecodePage {
             source: pdf_path.clone(),
             luma: p.luma,
+            rgb: p.rgb,
             width: p.width,
             height: p.height,
         })

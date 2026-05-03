@@ -420,12 +420,18 @@ fn load_input(path: &std::path::Path) -> Result<Vec<DecodePage>, String> {
         return render_pdf_pages(path, DEFAULT_PDF_RENDER_DPI);
     }
     // Plain image. Decode and wrap in a single DecodePage.
+    // Populate both `luma` (for legacy + v3 B&W decoders) and
+    // `rgb` (for v3 CMY decoder); image inputs are typically B&W
+    // scans, so the RGB will look grayscale and `has_color` will
+    // route to the grayscale paths anyway.
     let img = image::open(path).map_err(|e| format!("{e}"))?;
     let luma = img.to_luma8();
+    let rgb = img.to_rgb8();
     let (w, h) = luma.dimensions();
     Ok(vec![DecodePage {
         source: path.to_path_buf(),
         luma: luma.into_raw(),
+        rgb: rgb.into_raw(),
         width: w,
         height: h,
     }])
