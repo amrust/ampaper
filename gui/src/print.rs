@@ -593,18 +593,6 @@ pub fn save_pages_as_pdf(
         let img_width_pt = page.width as f32 * 72.0 / dpi as f32;
         let img_height_pt = page.height as f32 * 72.0 / dpi as f32;
 
-        // Pages: Letter unless header is None AND bitmap is bigger
-        // than Letter (caller knows what they want — keep the
-        // tight-bitmap fallback for testing). With header on, always
-        // Letter.
-        let use_letter_page = header.is_some()
-            || (img_width_pt <= LETTER_WIDTH_PT && img_height_pt <= LETTER_HEIGHT_PT);
-        let (page_width_pt, page_height_pt) = if use_letter_page {
-            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
-        } else {
-            (img_width_pt, img_height_pt)
-        };
-
         // Bitmap bottom-left coordinate. Centered horizontally.
         // Vertically: top edge sits PAGE_MARGIN + header_h + gap
         // below the page top when header is on; just PAGE_MARGIN
@@ -614,6 +602,39 @@ pub fn save_pages_as_pdf(
         } else {
             0.0
         };
+
+        // Page sizing: use Letter when the image fits beneath the
+        // header (when present) within Letter dimensions.
+        // Otherwise use a custom page big enough to hold the
+        // bitmap. Earlier code forced Letter whenever a header
+        // was present, which silently clipped any bitmap that
+        // exceeded Letter — caught when users dropped print_dpi
+        // to 200 and the v3 CMY bitmap (sized for 600 DPI)
+        // became 25" wide and got cropped to the visible Letter
+        // portion. The "+ top_overhead" allows for the header
+        // band + 0.5" top margin; matching the positioning
+        // below. Width has no margin requirement because the
+        // image is centered horizontally regardless.
+        let top_overhead_pt = PAGE_MARGIN_PT + header_band_pt;
+        let min_page_width_pt = img_width_pt;
+        let min_page_height_pt = img_height_pt + top_overhead_pt;
+        let (page_width_pt, page_height_pt) = if min_page_width_pt <= LETTER_WIDTH_PT
+            && min_page_height_pt <= LETTER_HEIGHT_PT
+        {
+            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
+        } else {
+            // Custom page: add a half-inch margin around the
+            // image so the printer's non-printable border doesn't
+            // clip the finder patterns. The legacy "no header,
+            // image exactly Letter" case still hits the Letter
+            // branch above with zero margin, so this only kicks
+            // in when the user has actually overflowed Letter.
+            (
+                min_page_width_pt + 2.0 * PAGE_MARGIN_PT,
+                min_page_height_pt + PAGE_MARGIN_PT,
+            )
+        };
+
         let img_x_pt = ((page_width_pt - img_width_pt) / 2.0).max(0.0);
         let img_top_pt = page_height_pt - PAGE_MARGIN_PT - header_band_pt;
         let img_bottom_pt = img_top_pt - img_height_pt;
@@ -750,19 +771,31 @@ pub fn save_rgb_pages_as_pdf(
         let img_width_pt = page.width as f32 * 72.0 / dpi as f32;
         let img_height_pt = page.height as f32 * 72.0 / dpi as f32;
 
-        let use_letter_page = header.is_some()
-            || (img_width_pt <= LETTER_WIDTH_PT && img_height_pt <= LETTER_HEIGHT_PT);
-        let (page_width_pt, page_height_pt) = if use_letter_page {
-            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
-        } else {
-            (img_width_pt, img_height_pt)
-        };
-
         let header_band_pt = if header.is_some() {
             HEADER_FONT_SIZE_PT + HEADER_GAP_PT
         } else {
             0.0
         };
+
+        // Same page-sizing logic as save_pages_as_pdf: pick Letter
+        // when the bitmap fits beneath the header within Letter,
+        // widen to a custom page when it doesn't (no silent
+        // clipping). See the matching comment in
+        // save_pages_as_pdf for the full reasoning.
+        let top_overhead_pt = PAGE_MARGIN_PT + header_band_pt;
+        let min_page_width_pt = img_width_pt;
+        let min_page_height_pt = img_height_pt + top_overhead_pt;
+        let (page_width_pt, page_height_pt) = if min_page_width_pt <= LETTER_WIDTH_PT
+            && min_page_height_pt <= LETTER_HEIGHT_PT
+        {
+            (LETTER_WIDTH_PT, LETTER_HEIGHT_PT)
+        } else {
+            (
+                min_page_width_pt + 2.0 * PAGE_MARGIN_PT,
+                min_page_height_pt + PAGE_MARGIN_PT,
+            )
+        };
+
         let img_x_pt = ((page_width_pt - img_width_pt) / 2.0).max(0.0);
         let img_top_pt = page_height_pt - PAGE_MARGIN_PT - header_band_pt;
         let img_bottom_pt = img_top_pt - img_height_pt;

@@ -216,7 +216,14 @@ impl PrintView {
             ui.add(egui::DragValue::new(&mut self.print_dpi).range(150..=2400));
             ui.label(
                 egui::RichText::new(
-                    "PDF page sizing only — does not affect printer DPI.",
+                    "How big the bitmap appears on the printed page. \
+                     This does NOT change the encoded data density — \
+                     for that, the codec geometry is hardcoded at \
+                     200-dot/inch on Letter (= 600 DPI display) for v3. \
+                     Lowering this DPI just makes the bitmap physically \
+                     bigger; the PDF will switch from Letter to a \
+                     larger custom page size when the bitmap doesn't \
+                     fit.",
                 )
                 .small()
                 .weak(),
