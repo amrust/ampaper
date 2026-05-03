@@ -254,18 +254,28 @@ pub fn encode_pages_cmyk(
             cells.push(anchor_cell);
         }
 
-        // Distribute data packets across channels for THIS page.
-        // Layout: page_idx covers `total_data_slots_per_page`
-        // packets total; first `data_slots_per_page_per_channel`
-        // go to C, next to M, last to Y. The packet's RaptorQ
-        // payload-ID carries its identity, so the decoder can
-        // pool them across channels regardless of where they
-        // landed.
+        // Distribute data packets across channels in round-robin
+        // BY CELL POSITION. Packet 0 → C cell 1, packet 1 → M
+        // cell 1, packet 2 → Y cell 1, packet 3 → C cell 2, and
+        // so on. When packets run out, the blank cells cluster
+        // uniformly at the bottom-right of all three channels at
+        // once — the rendered page shows a clean "data fills the
+        // top, white space below" layout.
+        //
+        // The earlier per-channel-sequential fill (C 0..N, M
+        // N..2N, Y 2N..3N) produced a "yellow runs out first"
+        // effect: the bottom of the page rendered solid blue
+        // (C+M ink but no Y ink) because Y's allocation came
+        // last and got truncated. Same total cells either way;
+        // just a better visual layout.
+        //
+        // Decoder doesn't care which channel a packet came from —
+        // RaptorQ payload-IDs are unique across channels and the
+        // decoder pools them all into one stream.
         let page_first_packet = page_idx * total_data_slots_per_page;
-        for (ch, cells) in channel_cells.iter_mut().enumerate() {
-            let ch_first = page_first_packet + ch * data_slots_per_page_per_channel;
-            for slot in 0..data_slots_per_page_per_channel {
-                let pkt_idx = ch_first + slot;
+        for slot in 0..data_slots_per_page_per_channel {
+            for (ch, cells) in channel_cells.iter_mut().enumerate() {
+                let pkt_idx = page_first_packet + slot * 3 + ch;
                 if let Some(packet) = packets.get(pkt_idx) {
                     let serialized = packet.serialize();
                     debug_assert_eq!(serialized.len(), 4 + SYMBOL_BYTES);
