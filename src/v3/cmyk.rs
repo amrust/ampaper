@@ -213,20 +213,22 @@ pub fn encode_pages_cmyk(
     let encoder = Encoder::with_defaults(rq_input, RAPTORQ_MTU);
     let oti_bytes = encoder.get_config().serialize();
 
-    // Page count: 3 channels × (cells_per_page - 1 anchor) data
-    // slots per physical page. Aim for K · (1 + overhead) packets,
-    // rounded up to fill complete pages.
+    // Emit K source + (K · overhead_pct) repair packets, mirroring
+    // the B&W encode_pages logic. Earlier code padded the packet
+    // count to fill `total_pages × total_data_slots_per_page`,
+    // which gave free extra loss tolerance but turned a
+    // 446-byte plaintext (K=3 source symbols, 8 emitted packets)
+    // into a 10,605-cell page rendered nearly all-black with
+    // unused repair. Now small payloads produce small bitmaps:
+    // anchors + a handful of data cells in the cyan channel,
+    // rest blank.
     let data_slots_per_page_per_channel = cells_per_page - 1;
     let total_data_slots_per_page = data_slots_per_page_per_channel * 3;
     let k = rq_input.len().div_ceil(SYMBOL_BYTES) as u32;
-    let target_packets =
-        ((k as u64 * (100 + repair_overhead_percent as u64)).div_ceil(100)) as u32;
-    let target_packets = target_packets.max(k + 5); // floor: K+5 for tiny inputs
-    let total_pages = (target_packets as usize).div_ceil(total_data_slots_per_page).max(1);
-    let total_packets_to_emit = total_pages * total_data_slots_per_page;
-    let repair = (total_packets_to_emit as u32).saturating_sub(k);
-
+    let repair = ((k * repair_overhead_percent) / 100).max(5);
     let packets = encoder.get_encoded_packets(repair);
+    let total_packets = packets.len();
+    let total_pages = total_packets.div_ceil(total_data_slots_per_page).max(1);
 
     let mut rgb_pages: Vec<RgbPageBitmap> = Vec::with_capacity(total_pages);
     for page_idx in 0..total_pages {

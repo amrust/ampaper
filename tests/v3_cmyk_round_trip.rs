@@ -86,6 +86,52 @@ fn density_gain_versus_bw() {
 }
 
 #[test]
+fn small_payload_produces_mostly_blank_page() {
+    // Pin: a 100-byte plaintext should NOT pad the encoded
+    // bitmap with thousands of unnecessary repair packets just
+    // to "fill the page". Most cells stay blank (rendered white
+    // in the composite RGB). Caught when the user asked why
+    // lorem.input (446 bytes) was encoding to a fully-black
+    // Letter page instead of a small data area in the corner.
+    use ampaper::v3::PageGeometry;
+
+    let plaintext = b"lorem ipsum dolor sit amet, consectetur adipiscing elit";
+    // Use a Letter-scale geometry to make the "page is mostly
+    // blank" property meaningful — small_geometry has so few
+    // cells that even a tiny payload fills it.
+    let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 1 };
+    let pages = encode_pages_cmyk(plaintext, &geom, 25).unwrap();
+    assert_eq!(pages.len(), 1);
+    let rgb = &pages[0];
+
+    // Count white pixels (R=G=B=255). With ~50 packets emitted
+    // into 858 cells per channel × 3 channels = 2574 cells, only
+    // ~50 cells are non-blank. Each cell is 32×32 dots; ratio of
+    // non-blank cells to total cells is ~50/2574 ≈ 2%. Rendered
+    // bitmap should be ≥ 90% white.
+    let n = (rgb.width as usize) * (rgb.height as usize);
+    let mut white_count = 0u32;
+    for i in 0..n {
+        let r = rgb.pixels[i * 3];
+        let g = rgb.pixels[i * 3 + 1];
+        let b = rgb.pixels[i * 3 + 2];
+        if r == 255 && g == 255 && b == 255 {
+            white_count += 1;
+        }
+    }
+    let white_ratio = white_count as f32 / n as f32;
+    assert!(
+        white_ratio > 0.85,
+        "small payload should leave ≥ 85% of bitmap white, got {:.1}%",
+        white_ratio * 100.0
+    );
+
+    // Also confirm round-trip still works.
+    let recovered = decode_pages_cmyk(&pages, &geom).unwrap();
+    assert_eq!(recovered, plaintext);
+}
+
+#[test]
 fn empty_input_rejected() {
     let err = encode_pages_cmyk(b"", &small_geometry(), 25).unwrap_err();
     assert!(matches!(err, ampaper::v3::CmyEncodeError::EmptyInput));
