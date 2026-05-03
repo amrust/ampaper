@@ -4,12 +4,17 @@
 Phase 2.5 complete (corner finder patterns, offset + scale-drift
 tolerance, rotation correction via affine transform, Otsu
 adaptive thresholding, 5-point sub-pixel sampling) + Phase 3a
-(zstd compression). The codec is ready for real print-and-scan
-experiments. Phase 3b (AES-256-GCM outer layer) and Phases 4+
-(density, modulation) are deferred to their respective
-milestones. The bytes-level, page-level, and Phase 2.5+3a
-wire formats defined here are stable; later phases extend them
-without breaking them.
+(zstd compression) + Phase 6 first slice (CMY 3-channel color
+codec, 3 bits/dot, single RaptorQ stream pooled across channels
+for yellow-fade resilience). The B&W codec is ready for real
+print-and-scan; the CMY codec adds 3× density and is ready for
+real-color print-and-scan once GUI integration lands.
+
+Phase 3b (AES-256-GCM outer layer) and Phase 7 (multi-level
+CMYK / 4-channel + K) are deferred to their respective
+milestones. The bytes-level, page-level, Phase 2.5+3a, and
+Phase 6 wire formats defined here are stable; later phases
+extend them without breaking them.
 
 **Scope:** v3 is a clean-sheet codec that lives **alongside**, not
 on top of, the legacy decoder. The legacy v1 (PB 1.10 binary
@@ -65,8 +70,8 @@ v3 addresses all three:
 | 3b     | AES-256-GCM outer layer (mirrors v2 posture)      | n/a (security)                    |
 | 4      | High dot density (250-300 dot/in)                 | ~3×                               |
 | 5      | 4-level grayscale modulation (2 bits/dot)         | ~5×                               |
-| 6      | CMYK 1-bit-per-channel (~3 effective bits/dot)    | ~8-9× best case                   |
-| 7      | Multi-level CMYK (premium, opt-in)                | ~15-20× best case                 |
+| 6      | CMY 3-channel color codec (3 bits/dot, pooled-packet pool) | ~6× vs PB 1.10 at same dpi |
+| 7      | Multi-level CMYK + K channel (premium, opt-in)    | ~15-20× best case                 |
 
 Each phase ships an encoder + decoder + acceptance test. Phase 1
 acceptance: round-trip 1 MB byte buffers + survive 33% packet drop
@@ -614,7 +619,98 @@ Earlier `pixels_per_dot=6` (100-dpi-equivalent) defaults gave
 2) the absolute-repair API double-counted overhead. Both
 fixed in Phase 3a.
 
-## Channel asymmetry (Phase 6+ planning note)
+## Phase 6: CMY 3-channel color codec
+
+This is the slice currently shipped in `src/v3/cmyk.rs`. Three
+B&W "channel layers" (cyan, magenta, yellow) are rendered into
+the same physical dot positions and composed via subtractive
+color into one RGB page bitmap. Each dot now carries 3 bits
+instead of 1, giving 3× more raw payload per page at the same
+dot pitch.
+
+### Why CMY only (no K)
+
+K=1 combined with C/M/Y=1 is visually indistinguishable from K
+alone — full ink coverage looks black regardless of which channel
+contributed which subtractive component. So 16 nominal CMYK 1-bit
+codes collapse to ~9 distinguishable colors, giving ~3.17 effective
+bits/dot — barely better than CMY's clean 3 bits/dot at the cost
+of a much messier decoder. Phase 6 ships CMY only. Adding K
+cleanly requires either dropping process-black combos at encode
+time or moving to multi-level CMYK (Phase 7).
+
+### Resilience model: pooled-packet pipeline
+
+A naive 3-channel encoding splits the source into 3 chunks (one
+per channel). When yellow ink fades on aged paper — by far the
+most common real-world failure mode for CMY archival prints — the
+yellow chunk is gone and the file is unrecoverable.
+
+Phase 6 instead runs a SINGLE RaptorQ encoder over the whole
+compressed source, generates enough packets to fill all the
+target pages × 3 channels, and distributes those packets across
+channels at encode time. Each channel runs its own anchor cell
+and B&W rendering, but the 3 channels share OTI / file_size /
+page_count / compression flag — they're parts of the same
+encoding.
+
+At decode time, each channel is parsed independently. **Per-
+channel parse failure is tolerated**: a yellow channel that has
+faded to all-white fails finder detection on its decomposed
+layer, but the surviving C and M channels still parse and
+contribute their cells to a shared pool. RaptorQ recovers from
+any K + small_overhead packets in the pool, regardless of which
+channel they came from.
+
+Pinned by `yellow_channel_loss_recovers_via_pooled_packets` —
+test stomps the entire B (yellow) component of every pixel in
+every page back to 255 (no yellow ink), confirms decode succeeds
+via the surviving C+M channels alone.
+
+### Pixel-level convention
+
+Subtractive color, fixed-threshold for the synthetic round-trip
+slice:
+
+| Channel C bit | Channel M bit | Channel Y bit | Output RGB pixel |
+|---|---|---|---|
+| 0 | 0 | 0 | (255, 255, 255) — white |
+| 1 | 0 | 0 | (0, 255, 255)   — cyan |
+| 0 | 1 | 0 | (255, 0, 255)   — magenta |
+| 0 | 0 | 1 | (255, 255, 0)   — yellow |
+| 1 | 1 | 0 | (0, 0, 255)     — blue |
+| 1 | 0 | 1 | (0, 255, 0)     — green |
+| 0 | 1 | 1 | (255, 0, 0)     — red |
+| 1 | 1 | 1 | (0, 0, 0)       — process black |
+
+Decoder convention (decompose):
+
+```rust
+C bit set ⇔ R < 128
+M bit set ⇔ G < 128
+Y bit set ⇔ B < 128
+```
+
+Future Phase 6b: per-channel Otsu (each color channel may have
+asymmetric scanner gamma — yellow reads dimmer than cyan on most
+CCDs), and a calibration palette in the page corners so the
+decoder can pick channel-specific thresholds from known-RGB
+reference colors.
+
+### Density at Phase 6 + GUI default geometry
+
+200-dpi-equivalent (`pixels_per_dot=3`, `nx=52`, `ny=68`) at
+3× per-cell capacity:
+
+- 3535 cells/page/channel × 120 bytes × 3 channels ÷ 1.25
+  (25% repair overhead) ≈ **848 KB raw payload per page**
+- With zstd 4× on text: **~3.4 MB compressed-equivalent per page**
+
+War & Peace plain text (~3.2 MB) fits on **one page**. Compared
+to PaperBack 1.10 + bzip2 at 200 dpi (~6 pages for the same
+input), v3 Phase 6 is ~6× denser at the same dot pitch.
+
+## Channel asymmetry (Phase 7 planning note)
 
 When CMYK modulation lands (Phase 6), the four channels MUST NOT
 share an ECC stream. Two reasons:

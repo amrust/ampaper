@@ -35,6 +35,7 @@
 // byte; v3 decoders MUST reject unknown versions.
 
 pub mod cell;
+pub mod cmyk;
 pub mod codec;
 pub mod decoder;
 pub mod encoder;
@@ -43,6 +44,9 @@ pub mod format;
 pub mod page;
 pub mod threshold;
 
+pub use cmyk::{
+    CmyDecodeError, CmyEncodeError, RgbPageBitmap, decode_pages_cmyk, encode_pages_cmyk,
+};
 pub use codec::{
     PageDecodeError, PageEncodeError, decode_pages, encode_pages,
 };
