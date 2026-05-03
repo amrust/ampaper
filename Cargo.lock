@@ -224,6 +224,7 @@ dependencies = [
  "getrandom 0.4.2",
  "image",
  "pbkdf2",
+ "raptorq",
  "sha1",
  "sha2 0.11.0",
 ]
@@ -3193,6 +3194,12 @@ name = "rangemap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
+
+[[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raw-window-handle"

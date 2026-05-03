@@ -54,6 +54,16 @@ sha2 = "0.11"
 # RustCrypto-adjacent way to ask the OS for that.
 getrandom = "0.4"
 
+# v3 codec ECC (M12+). RaptorQ (RFC 6330) is a rateless fountain
+# code: any K + small overhead encoded packets recover the source.
+# Replaces v1/v2's fixed RS+XOR group structure with arbitrary
+# erasure tolerance, eliminating PB-1.10's per-page
+# wasted-trailing-cells remainder. Apache-2.0, pure Rust, std-only
+# (the no-std story from the upstream crate isn't relevant here —
+# ampaper already pulls bzip2/aes/getrandom which need std too).
+# See docs/FORMAT-V3.md for how RaptorQ output maps onto cells.
+raptorq = "2"
+
 # Other deps (windows-rs for GDI / WIA / TWAIN at M9/M10) land
 # at the milestone that needs them. See docs/MILESTONES.md for
 # the staging order.
