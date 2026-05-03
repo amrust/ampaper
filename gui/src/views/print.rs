@@ -32,6 +32,10 @@ pub struct PrintView {
     /// as v1; pre-encoded bitmaps just pass through). Like the Encode
     /// tab, we never persist this — it's session state only.
     v2_password: String,
+    /// Codec selection. False = PaperBack 1.10-compatible (v1/v2);
+    /// true = the experimental v3 codec (RaptorQ + corner finders).
+    /// Defaults to legacy until v3 has had real-paper validation.
+    use_v3: bool,
     last_status: String,
 }
 
@@ -41,6 +45,7 @@ impl Default for PrintView {
             queued_paths: Vec::new(),
             print_dpi: 600,
             v2_password: String::new(),
+            use_v3: false,
             last_status: String::new(),
         }
     }
@@ -64,6 +69,8 @@ impl PrintView {
         ui.add_space(8.0);
 
         self.show_input_row(ui);
+        ui.add_space(8.0);
+        self.show_codec_row(ui);
         ui.add_space(8.0);
         self.show_dpi_row(ui);
         ui.add_space(8.0);
@@ -128,6 +135,27 @@ impl PrintView {
             for p in &self.queued_paths {
                 ui.label(egui::RichText::new(p.display().to_string()).small().weak());
             }
+        }
+    }
+
+    fn show_codec_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Codec:");
+            ui.radio_value(&mut self.use_v3, false, "Black and white (PaperBack 1.10)");
+            ui.radio_value(&mut self.use_v3, true, "Black and white (v3, experimental)");
+        });
+        if self.use_v3 {
+            ui.label(
+                egui::RichText::new(
+                    "v3 uses RaptorQ rateless ECC and QR-style corner finders. \
+                     Higher density per page than PaperBack 1.10, but not \
+                     decodable by PaperBack 1.10 itself. Synthetic round-trip \
+                     tests pass; real print-and-scan validation is the \
+                     reason this option is here.",
+                )
+                .small()
+                .weak(),
+            );
         }
     }
 
@@ -281,6 +309,9 @@ impl PrintView {
     /// also wrote the error to `last_status` for the user.
     fn prepare(&mut self, encode_settings: &EncodeSettings) -> Option<Vec<PrintPage>> {
         self.last_status = "Preparing pages...".into();
+        if self.use_v3 {
+            return self.prepare_v3();
+        }
         let opts = encode_options_from_settings(encode_settings);
         let v2 = if encode_settings.v2_encrypt && !self.v2_password.is_empty() {
             Some(self.v2_password.as_str())
@@ -306,6 +337,70 @@ impl PrintView {
                 None
             }
         }
+    }
+
+    /// v3 codec encode path. For raw inputs only — pre-rendered
+    /// bitmaps would pass through unchanged in legacy mode but
+    /// don't make sense for v3 (the bitmap would have to already
+    /// have been produced by v3, in which case the user can just
+    /// re-print it directly). For first-slice GUI integration we
+    /// hardcode the page geometry; once real-paper validation
+    /// proves the parameters, the Encode-tab Quality preset can
+    /// be extended to let the user tune density per print job.
+    fn prepare_v3(&mut self) -> Option<Vec<PrintPage>> {
+        use ampaper::v3::{PageGeometry, encode_pages};
+
+        if self.queued_paths.is_empty() {
+            self.last_status = "no files selected".into();
+            return None;
+        }
+
+        // Hardcoded geometry: 26 × 33 cells at 6 device pixels per
+        // data dot → 5088 × 6432 pixels per page, fits inside Letter
+        // at 600 DPI (5100 × 6600). Each cell carries 120 bytes of
+        // RaptorQ symbol payload, so one page holds ~100 KB of
+        // source data after the per-page anchor + RaptorQ overhead.
+        let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
+        // 25% repair packets — generous loss tolerance starting
+        // point. Tighten once real-scan loss profiles say it can
+        // be smaller, loosen if real scans fail to recover.
+        let repair_pct = 25u32;
+
+        let mut all_pages: Vec<PrintPage> = Vec::new();
+        for path in &self.queued_paths {
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.last_status = format!("{}: {e}", path.display());
+                    return None;
+                }
+            };
+            if bytes.is_empty() {
+                self.last_status =
+                    format!("{}: v3 codec rejects empty input", path.display());
+                return None;
+            }
+            // Repair packet count: 25% of source K, minimum 5.
+            // Source K ≈ ceil(bytes / 120) (per-cell symbol size).
+            let source_k = bytes.len().div_ceil(120) as u32;
+            let repair = ((source_k * repair_pct) / 100).max(5);
+
+            let pages = match encode_pages(&bytes, &geom, repair) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.last_status = format!("{}: v3 encode: {e}", path.display());
+                    return None;
+                }
+            };
+            for page in pages {
+                all_pages.push(PrintPage {
+                    bitmap: page.pixels,
+                    width: page.width,
+                    height: page.height,
+                });
+            }
+        }
+        Some(all_pages)
     }
 
     fn doc_name(&self) -> String {

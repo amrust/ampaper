@@ -271,10 +271,25 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
         return Err("no input pages".into());
     }
 
-    // First pass: classify each page's cells. We do this even if
-    // the eventual decode fails — the user still wants to see WHY
-    // (e.g., almost everything red = the scan is too noisy / the
-    // grid wasn't recovered).
+    // Sniff for v3 first: try to detect QR-style corner finders on
+    // the first page. If they're there, this is a v3 PDF — route
+    // to the v3 decoder instead of the legacy scan path. Legacy
+    // scan_decode would just emit "no SuperBlock decoded" on a v3
+    // page, since v3 has no PB-1.10-style SuperBlock.
+    if sniff_v3(&req.pages[0]) {
+        send(DecodeMessage::Status(
+            "v3 codec detected — decoding via RaptorQ".into(),
+        ));
+        // Skip the legacy per-cell classification pass for v3 pages
+        // (it'd show all-red because v3 cells aren't PB-1.10 cells).
+        // Future slice will add v3-specific cell classification.
+        return run_v3_decode(req);
+    }
+
+    // Legacy path. First pass: classify each page's cells. We do
+    // this even if the eventual decode fails — the user still
+    // wants to see WHY (e.g., almost everything red = the scan is
+    // too noisy / the grid wasn't recovered).
     for (i, page) in req.pages.iter().enumerate() {
         send(DecodeMessage::Status(format!(
             "Analyzing page {}/{}",
@@ -311,6 +326,47 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
         .collect();
     let password = req.password.as_deref().map(str::as_bytes);
     scan_decode(&pages, password).map_err(|e| format!("{e}"))
+}
+
+/// Try to detect v3 corner finders on a page. Returns true if all
+/// three corner finders are found at the default v3 page geometry.
+fn sniff_v3(page: &DecodePage) -> bool {
+    use ampaper::v3::PageGeometry;
+    use ampaper::v3::finder::locate_finders;
+    use ampaper::v3::page::PageBitmap;
+
+    // The Print-tab v3 path uses geometry { nx: 26, ny: 33,
+    // pixels_per_dot: 6 }. That's the fixed default for first-
+    // slice v3; eventually we may sniff geometry from the bitmap
+    // itself, but for now matching the encoder's hardcoded value
+    // is sufficient.
+    let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
+    // PageBitmap takes ownership of pixels; clone is unfortunate
+    // but unavoidable without refactoring the v3 API to borrow.
+    // For a Letter-at-600-DPI page that's a one-time ~33 MB clone,
+    // negligible compared to PDF rendering time that already ran.
+    let bm = PageBitmap {
+        pixels: page.luma.clone(),
+        width: page.width,
+        height: page.height,
+    };
+    locate_finders(&bm, geom.page_width_dots(), geom.page_height_dots()).is_ok()
+}
+
+fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
+    use ampaper::v3::{PageBitmap, PageGeometry, decode_pages};
+
+    let geom = PageGeometry { nx: 26, ny: 33, pixels_per_dot: 6 };
+    let pages: Vec<PageBitmap> = req
+        .pages
+        .iter()
+        .map(|p| PageBitmap {
+            pixels: p.luma.clone(),
+            width: p.width,
+            height: p.height,
+        })
+        .collect();
+    decode_pages(&pages, &geom).map_err(|e| format!("v3 decode: {e}"))
 }
 
 /// Run scan_extract over a single page and bucket each resulting
