@@ -615,7 +615,17 @@ pub fn save_pages_as_pdf(
         // band + 0.5" top margin; matching the positioning
         // below. Width has no margin requirement because the
         // image is centered horizontally regardless.
-        let top_overhead_pt = PAGE_MARGIN_PT + header_band_pt;
+        // Top overhead is only needed when a header is drawn —
+        // PAGE_MARGIN above the header baseline, plus the header
+        // band itself. With no header, the image is allowed to
+        // fill the page edge-to-edge (the legacy 200-dot/in
+        // round-trip emits an exactly-Letter-sized bitmap and
+        // expects to use Letter without forcing margin).
+        let top_overhead_pt = if header.is_some() {
+            PAGE_MARGIN_PT + header_band_pt
+        } else {
+            0.0
+        };
         let min_page_width_pt = img_width_pt;
         let min_page_height_pt = img_height_pt + top_overhead_pt;
         let (page_width_pt, page_height_pt) = if min_page_width_pt <= LETTER_WIDTH_PT
@@ -782,7 +792,17 @@ pub fn save_rgb_pages_as_pdf(
         // widen to a custom page when it doesn't (no silent
         // clipping). See the matching comment in
         // save_pages_as_pdf for the full reasoning.
-        let top_overhead_pt = PAGE_MARGIN_PT + header_band_pt;
+        // Top overhead is only needed when a header is drawn —
+        // PAGE_MARGIN above the header baseline, plus the header
+        // band itself. With no header, the image is allowed to
+        // fill the page edge-to-edge (the legacy 200-dot/in
+        // round-trip emits an exactly-Letter-sized bitmap and
+        // expects to use Letter without forcing margin).
+        let top_overhead_pt = if header.is_some() {
+            PAGE_MARGIN_PT + header_band_pt
+        } else {
+            0.0
+        };
         let min_page_width_pt = img_width_pt;
         let min_page_height_pt = img_height_pt + top_overhead_pt;
         let (page_width_pt, page_height_pt) = if min_page_width_pt <= LETTER_WIDTH_PT
