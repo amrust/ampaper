@@ -239,9 +239,11 @@ dependencies = [
  "image",
  "pdfium-render",
  "printpdf",
+ "raptorq",
  "rfd",
  "serde",
  "windows 0.54.0",
+ "zstd",
 ]
 
 [[package]]

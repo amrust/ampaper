@@ -303,11 +303,23 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
     // works for the legacy scan_decode path's calibration range
     // (FORMAT-V1.md §5: scan_decode tuned for ~3 px/dot at 300
     // DPI render, breaks at higher).
-    let v3_detected = has_color(&req.pages[0]) || sniff_v3(&req.pages[0]);
+    let initial_color = has_color(&req.pages[0]);
+    let initial_v3_bw = sniff_v3(&req.pages[0]);
+    let v3_detected = initial_color || initial_v3_bw;
+    eprintln!(
+        "[v3] dispatch sniff: input page 1 is {}x{} pixels, has_color={}, v3_bw_finders={}, v3_detected={}",
+        req.pages[0].width, req.pages[0].height, initial_color, initial_v3_bw, v3_detected
+    );
     let pages_owned: Vec<DecodePage>;
     let pages_for_decode: &[DecodePage] = if v3_detected {
         match rerender_pdf_pages_at(req.pages.as_slice(), V3_PDF_RENDER_DPI) {
             Ok(p) => {
+                eprintln!(
+                    "[v3] re-rendered {} page(s) from PDF source at {} DPI for v3 cell sampling (was {} DPI)",
+                    p.len(),
+                    V3_PDF_RENDER_DPI,
+                    DEFAULT_PDF_RENDER_DPI
+                );
                 pages_owned = p;
                 send(DecodeMessage::Status(format!(
                     "Re-rendered PDF input at {V3_PDF_RENDER_DPI} DPI for v3 cell sampling"
@@ -317,6 +329,10 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
             Err(e) => {
                 // Re-render failure (e.g. source is an image, not a
                 // PDF) is fine — fall back to the original render.
+                eprintln!(
+                    "[v3] re-render at {} DPI unavailable ({}); using original-DPI bitmap",
+                    V3_PDF_RENDER_DPI, e
+                );
                 send(DecodeMessage::Status(format!(
                     "Using original-DPI bitmap (re-render unavailable: {e})"
                 )));
@@ -331,17 +347,20 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
         password: req.password.clone(),
     };
     if has_color(&rerendered_req.pages[0]) {
+        eprintln!("[v3] routing to v3 CMY decoder");
         send(DecodeMessage::Status(
             "v3 CMY codec detected — decoding via RaptorQ + 3-channel pool".into(),
         ));
         return run_v3_cmy_decode(&rerendered_req);
     }
     if sniff_v3(&rerendered_req.pages[0]) {
+        eprintln!("[v3] routing to v3 B&W decoder");
         send(DecodeMessage::Status(
             "v3 B&W codec detected — decoding via RaptorQ".into(),
         ));
         return run_v3_decode(&rerendered_req);
     }
+    eprintln!("[v3] no v3 codec detected on re-rendered bitmap; falling through to legacy path");
 
     // Legacy path. First pass: classify each page's cells. We do
     // this even if the eventual decode fails — the user still
@@ -403,13 +422,38 @@ fn sniff_v3(page: &DecodePage) -> bool {
     detect_geometry(&bm).is_ok()
 }
 
+/// Decode v3 B&W pages with stage-by-stage diagnostic logging to
+/// stderr. Captured by swaplog when the GUI is launched via the
+/// VS Code build/rebuild task — gives the user visibility into
+/// where decode succeeded or failed during a real print-and-scan
+/// test, since the v3 codec doesn't have the per-cell colored
+/// classification grid the legacy path emits.
+///
+/// Stages logged: page dimensions → finder geometry detection →
+/// per-page cell-extraction count → CRC-validity breakdown
+/// (anchors / data / bad-CRC) → first-anchor metadata → RaptorQ
+/// convergence → decompression → final size match.
 fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
-    use ampaper::v3::{PageBitmap, decode_pages_auto};
+    use ampaper::v3::cell::{
+        AnchorPayload, CELL_BYTES, Compression, DecodedCell, SYMBOL_BYTES, decode_cell,
+    };
+    use ampaper::v3::finder::detect_geometry;
+    use ampaper::v3::page::{PageBitmap, PageGeometry, parse_page};
+    use raptorq::{Decoder, EncodingPacket, ObjectTransmissionInformation};
 
-    // Auto-detect geometry from the first page's finders. The
-    // encoder no longer needs to share a hardcoded geometry with
-    // the decoder — Density UI selections (Loose / Standard /
-    // Dense / Max) all decode through the same path here.
+    eprintln!("[v3 BW] decode start: {} page(s)", req.pages.len());
+    for (i, p) in req.pages.iter().enumerate() {
+        eprintln!(
+            "[v3 BW]   page {}: bitmap {}x{}",
+            i + 1,
+            p.width,
+            p.height
+        );
+    }
+    if req.pages.is_empty() {
+        return Err("v3 decode: no input pages".into());
+    }
+
     let pages: Vec<PageBitmap> = req
         .pages
         .iter()
@@ -419,7 +463,205 @@ fn run_v3_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
             height: p.height,
         })
         .collect();
-    decode_pages_auto(&pages).map_err(|e| format!("v3 decode: {e}"))
+
+    // Stage 1: detect geometry from first page's finders.
+    log_luma_stats("v3 BW", &pages[0].pixels);
+    save_diag_luma(
+        "bw-luma.png",
+        &pages[0].pixels,
+        pages[0].width,
+        pages[0].height,
+    );
+    let detected = match detect_geometry(&pages[0]) {
+        Ok(g) => {
+            eprintln!(
+                "[v3 BW] detect_geometry: nx={} ny={} ppd={} (page_dots={}x{})",
+                g.nx,
+                g.ny,
+                g.pixels_per_dot,
+                g.nx * 32 + 16,
+                g.ny * 32 + 16
+            );
+            for (label, hit) in [
+                ("TL", &g.finders[0]),
+                ("TR", &g.finders[1]),
+                ("BL", &g.finders[2]),
+            ] {
+                eprintln!(
+                    "[v3 BW]   {} center=({:.1},{:.1}) unit={:.3}",
+                    label, hit.center_x, hit.center_y, hit.unit
+                );
+            }
+            g
+        }
+        Err(e) => {
+            eprintln!("[v3 BW] detect_geometry FAILED: {e}");
+            return Err(format!("v3 decode: {e}"));
+        }
+    };
+    let geom = PageGeometry {
+        nx: detected.nx,
+        ny: detected.ny,
+        pixels_per_dot: detected.pixels_per_dot,
+    };
+    let cells_expected = geom.cells_per_page();
+
+    // Stage 2: parse cells per page; classify each cell.
+    let mut all_cells: Vec<[u8; CELL_BYTES]> = Vec::new();
+    let mut anchor: Option<AnchorPayload> = None;
+    let mut anchor_disagreement = false;
+    let mut total_data_pkts = 0u32;
+
+    for (page_idx, page) in pages.iter().enumerate() {
+        match parse_page(page, &geom) {
+            Ok(cells) => {
+                let extracted = cells.len();
+                let mut anchors = 0u32;
+                let mut data = 0u32;
+                let mut invalid = 0u32;
+                for cell in &cells {
+                    match decode_cell(cell) {
+                        Ok(DecodedCell::Anchor(p)) => {
+                            anchors += 1;
+                            match anchor {
+                                None => anchor = Some(p),
+                                Some(prev) => {
+                                    if prev.oti != p.oti
+                                        || prev.file_size != p.file_size
+                                        || prev.total_pages != p.total_pages
+                                        || prev.compression != p.compression
+                                    {
+                                        anchor_disagreement = true;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(DecodedCell::Data { .. }) => data += 1,
+                        Err(_) => invalid += 1,
+                    }
+                }
+                eprintln!(
+                    "[v3 BW] page {}/{} parse: {}/{} cells extracted — {} anchor + {} data + {} bad-CRC",
+                    page_idx + 1,
+                    pages.len(),
+                    extracted,
+                    cells_expected,
+                    anchors,
+                    data,
+                    invalid
+                );
+                total_data_pkts += data;
+                all_cells.extend(cells);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[v3 BW] page {}/{} parse FAILED: {e}",
+                    page_idx + 1,
+                    pages.len()
+                );
+                return Err(format!("v3 decode: {e}"));
+            }
+        }
+    }
+    if anchor_disagreement {
+        eprintln!("[v3 BW] anchor metadata disagreement across pages");
+        return Err("v3 decode: pages from different encode runs (anchor mismatch)".into());
+    }
+    let anchor = match anchor {
+        Some(a) => {
+            eprintln!(
+                "[v3 BW] anchor: file_size={} total_pages={} page_index={} compression={:?}",
+                a.file_size, a.total_pages, a.page_index, a.compression
+            );
+            a
+        }
+        None => {
+            eprintln!("[v3 BW] no valid anchor cell on any page");
+            return Err("v3 decode: no valid anchor cell".into());
+        }
+    };
+
+    // Stage 3: RaptorQ.
+    let oti = ObjectTransmissionInformation::deserialize(&anchor.oti);
+    let k_min = (anchor.file_size as usize).div_ceil(SYMBOL_BYTES);
+    eprintln!(
+        "[v3 BW] RaptorQ: feeding {} data packets, K_source≥{} (need K + small overhead to converge)",
+        total_data_pkts, k_min
+    );
+    let mut decoder = Decoder::new(oti);
+    let mut packet_buf = Vec::with_capacity(4 + SYMBOL_BYTES);
+    let mut rq_recovered: Option<Vec<u8>> = None;
+    let mut packets_fed = 0u32;
+    for cell_bytes in &all_cells {
+        let Ok(DecodedCell::Data { payload_id, symbol }) = decode_cell(cell_bytes) else {
+            continue;
+        };
+        packet_buf.clear();
+        packet_buf.extend_from_slice(&payload_id);
+        packet_buf.extend_from_slice(symbol);
+        let packet = EncodingPacket::deserialize(&packet_buf);
+        packets_fed += 1;
+        if let Some(out) = decoder.decode(packet) {
+            rq_recovered = Some(out);
+            eprintln!(
+                "[v3 BW] RaptorQ converged after {} packets",
+                packets_fed
+            );
+            break;
+        }
+    }
+    let rq_recovered = match rq_recovered {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[v3 BW] RaptorQ FAILED to converge after {} packets (insufficient or too damaged)",
+                packets_fed
+            );
+            return Err(
+                "v3 decode: RaptorQ did not converge — too few or too damaged cells".into(),
+            );
+        }
+    };
+    eprintln!("[v3 BW] RaptorQ output: {} bytes", rq_recovered.len());
+
+    // Stage 4: decompress + size validation.
+    let plaintext = match anchor.compression {
+        Compression::None => {
+            eprintln!("[v3 BW] decompression: none (raw)");
+            rq_recovered
+        }
+        Compression::Zstd => match zstd::decode_all(rq_recovered.as_slice()) {
+            Ok(out) => {
+                eprintln!(
+                    "[v3 BW] zstd: {} → {} bytes",
+                    rq_recovered.len(),
+                    out.len()
+                );
+                out
+            }
+            Err(e) => {
+                eprintln!("[v3 BW] zstd FAILED: {e}");
+                return Err(format!("v3 decode: zstd: {e}"));
+            }
+        },
+    };
+    if plaintext.len() as u64 != anchor.file_size {
+        eprintln!(
+            "[v3 BW] SIZE MISMATCH: got {} bytes, anchor said {}",
+            plaintext.len(),
+            anchor.file_size
+        );
+        return Err(format!(
+            "v3 decode: decompressed size {} doesn't match anchor's claimed file_size {}",
+            plaintext.len(),
+            anchor.file_size
+        ));
+    }
+    eprintln!(
+        "[v3 BW] OK: recovered {} bytes (matches anchor)",
+        plaintext.len()
+    );
+    Ok(plaintext)
 }
 
 /// Sample pixels across the page; report whether any have
@@ -462,8 +704,34 @@ fn has_color(page: &DecodePage) -> bool {
     color_count * 20 > checked
 }
 
+/// Decode v3 CMY pages with stage-by-stage diagnostic logging to
+/// stderr. Same shape as [`run_v3_decode`] but with per-channel
+/// (C / M / Y) breakdown so the user can see when one channel
+/// fades catastrophically (the canonical yellow-on-aged-paper
+/// failure mode) and the surviving channels still pool enough
+/// packets for RaptorQ. Captured by swaplog.
 fn run_v3_cmy_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
-    use ampaper::v3::{RgbPageBitmap, decode_pages_cmyk_auto};
+    use ampaper::v3::cell::{
+        AnchorPayload, CELL_BYTES, Compression, DecodedCell, SYMBOL_BYTES, decode_cell,
+    };
+    use ampaper::v3::cmyk::decompose_cmy;
+    use ampaper::v3::finder::detect_geometry;
+    use ampaper::v3::page::{PageBitmap, PageGeometry, parse_page};
+    use ampaper::v3::RgbPageBitmap;
+    use raptorq::{Decoder, EncodingPacket, ObjectTransmissionInformation};
+
+    eprintln!("[v3 CMY] decode start: {} page(s)", req.pages.len());
+    for (i, p) in req.pages.iter().enumerate() {
+        eprintln!(
+            "[v3 CMY]   page {}: bitmap {}x{}",
+            i + 1,
+            p.width,
+            p.height
+        );
+    }
+    if req.pages.is_empty() {
+        return Err("v3 CMY decode: no input pages".into());
+    }
 
     let pages: Vec<RgbPageBitmap> = req
         .pages
@@ -474,7 +742,354 @@ fn run_v3_cmy_decode(req: &DecodeRequest) -> Result<Vec<u8>, String> {
             height: p.height,
         })
         .collect();
-    decode_pages_cmyk_auto(&pages).map_err(|e| format!("v3 CMY decode: {e}"))
+
+    // Stage 1: luma view of page 0 + finder detection. The luma
+    // composite carries the finder pattern as composite-black,
+    // robust to per-channel ink fade.
+    let luma = rgb_to_luma(&pages[0]);
+    log_luma_stats("v3 CMY", &luma.pixels);
+    save_diag_luma("cmy-luma.png", &luma.pixels, luma.width, luma.height);
+    save_diag_rgb(
+        "cmy-rgb.png",
+        &pages[0].pixels,
+        pages[0].width,
+        pages[0].height,
+    );
+    let detected = match detect_geometry(&luma) {
+        Ok(g) => {
+            eprintln!(
+                "[v3 CMY] luma detect_geometry: nx={} ny={} ppd={} (page_dots={}x{})",
+                g.nx,
+                g.ny,
+                g.pixels_per_dot,
+                g.nx * 32 + 16,
+                g.ny * 32 + 16
+            );
+            for (label, hit) in [
+                ("TL", &g.finders[0]),
+                ("TR", &g.finders[1]),
+                ("BL", &g.finders[2]),
+            ] {
+                eprintln!(
+                    "[v3 CMY]   {} center=({:.1},{:.1}) unit={:.3}",
+                    label, hit.center_x, hit.center_y, hit.unit
+                );
+            }
+            g
+        }
+        Err(e) => {
+            eprintln!("[v3 CMY] luma detect_geometry FAILED: {e}");
+            return Err(format!("v3 CMY decode: {e}"));
+        }
+    };
+    let geom = PageGeometry {
+        nx: detected.nx,
+        ny: detected.ny,
+        pixels_per_dot: detected.pixels_per_dot,
+    };
+    let cells_expected = geom.cells_per_page();
+
+    // Stage 2: per-page, per-channel parse + cell-validity counting.
+    let mut all_cells: Vec<[u8; CELL_BYTES]> = Vec::new();
+    let mut anchor: Option<AnchorPayload> = None;
+    let mut anchor_disagreement = false;
+    let mut total_data_pkts = 0u32;
+
+    for (page_idx, rgb) in pages.iter().enumerate() {
+        eprintln!(
+            "[v3 CMY] page {}/{}: decompose RGB → C/M/Y layers",
+            page_idx + 1,
+            pages.len()
+        );
+        let (c_layer, m_layer, y_layer) = decompose_cmy(rgb);
+        let layers: [(&str, &PageBitmap); 3] =
+            [("C", &c_layer), ("M", &m_layer), ("Y", &y_layer)];
+        let mut page_total_anchors = 0u32;
+        let mut page_total_data = 0u32;
+        let mut page_total_invalid = 0u32;
+        let mut page_channels_ok = 0u32;
+        for (label, layer) in layers {
+            match parse_page(layer, &geom) {
+                Ok(cells) => {
+                    let extracted = cells.len();
+                    let mut anchors = 0u32;
+                    let mut data = 0u32;
+                    let mut invalid = 0u32;
+                    for cell in &cells {
+                        match decode_cell(cell) {
+                            Ok(DecodedCell::Anchor(p)) => {
+                                anchors += 1;
+                                match anchor {
+                                    None => anchor = Some(p),
+                                    Some(prev) => {
+                                        if prev.oti != p.oti
+                                            || prev.file_size != p.file_size
+                                            || prev.total_pages != p.total_pages
+                                            || prev.compression != p.compression
+                                        {
+                                            anchor_disagreement = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(DecodedCell::Data { .. }) => data += 1,
+                            Err(_) => invalid += 1,
+                        }
+                    }
+                    eprintln!(
+                        "[v3 CMY]   {} layer parse: {}/{} extracted — {} anchor + {} data + {} bad-CRC",
+                        label, extracted, cells_expected, anchors, data, invalid
+                    );
+                    page_total_anchors += anchors;
+                    page_total_data += data;
+                    page_total_invalid += invalid;
+                    page_channels_ok += 1;
+                    all_cells.extend(cells);
+                }
+                Err(e) => {
+                    // CMY decode tolerates per-channel parse failure
+                    // (yellow ink fade is the canonical case). Surviving
+                    // channels still contribute; RaptorQ recovers from
+                    // K + small overhead.
+                    eprintln!(
+                        "[v3 CMY]   {} layer parse FAILED: {e} — channel skipped",
+                        label
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[v3 CMY] page {} totals: {}/3 channels OK, {} anchors, {} data, {} bad-CRC",
+            page_idx + 1,
+            page_channels_ok,
+            page_total_anchors,
+            page_total_data,
+            page_total_invalid
+        );
+        total_data_pkts += page_total_data;
+    }
+    if anchor_disagreement {
+        eprintln!("[v3 CMY] anchor metadata disagreement across channels");
+        return Err("v3 CMY decode: per-channel anchors disagree on file metadata".into());
+    }
+    let anchor = match anchor {
+        Some(a) => {
+            eprintln!(
+                "[v3 CMY] anchor: file_size={} total_pages={} page_index={} compression={:?}",
+                a.file_size, a.total_pages, a.page_index, a.compression
+            );
+            a
+        }
+        None => {
+            eprintln!("[v3 CMY] no valid anchor cell on any color channel");
+            return Err("v3 CMY decode: no valid anchor cell on any color channel".into());
+        }
+    };
+
+    // Stage 3: pool data cells across all channels, feed RaptorQ.
+    let oti = ObjectTransmissionInformation::deserialize(&anchor.oti);
+    let k_min = (anchor.file_size as usize).div_ceil(SYMBOL_BYTES);
+    eprintln!(
+        "[v3 CMY] RaptorQ: pooling {} data packets across all channels, K_source≥{} (need K + small overhead to converge)",
+        total_data_pkts, k_min
+    );
+    let mut decoder = Decoder::new(oti);
+    let mut packet_buf = Vec::with_capacity(4 + SYMBOL_BYTES);
+    let mut rq_recovered: Option<Vec<u8>> = None;
+    let mut packets_fed = 0u32;
+    for cell_bytes in &all_cells {
+        let Ok(DecodedCell::Data { payload_id, symbol }) = decode_cell(cell_bytes) else {
+            continue;
+        };
+        packet_buf.clear();
+        packet_buf.extend_from_slice(&payload_id);
+        packet_buf.extend_from_slice(symbol);
+        let packet = EncodingPacket::deserialize(&packet_buf);
+        packets_fed += 1;
+        if let Some(out) = decoder.decode(packet) {
+            rq_recovered = Some(out);
+            eprintln!(
+                "[v3 CMY] RaptorQ converged after {} packets",
+                packets_fed
+            );
+            break;
+        }
+    }
+    let rq_recovered = match rq_recovered {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[v3 CMY] RaptorQ FAILED to converge after {} packets (insufficient or too damaged across all channels)",
+                packets_fed
+            );
+            return Err(
+                "v3 CMY decode: RaptorQ did not converge — too few or too damaged cells across all channels".into(),
+            );
+        }
+    };
+    eprintln!("[v3 CMY] RaptorQ output: {} bytes", rq_recovered.len());
+
+    // Stage 4: decompress + size validation.
+    let plaintext = match anchor.compression {
+        Compression::None => {
+            eprintln!("[v3 CMY] decompression: none (raw)");
+            rq_recovered
+        }
+        Compression::Zstd => match zstd::decode_all(rq_recovered.as_slice()) {
+            Ok(out) => {
+                eprintln!(
+                    "[v3 CMY] zstd: {} → {} bytes",
+                    rq_recovered.len(),
+                    out.len()
+                );
+                out
+            }
+            Err(e) => {
+                eprintln!("[v3 CMY] zstd FAILED: {e}");
+                return Err(format!("v3 CMY decode: zstd: {e}"));
+            }
+        },
+    };
+    if plaintext.len() as u64 != anchor.file_size {
+        eprintln!(
+            "[v3 CMY] SIZE MISMATCH: got {} bytes, anchor said {}",
+            plaintext.len(),
+            anchor.file_size
+        );
+        return Err(format!(
+            "v3 CMY decode: decompressed size {} doesn't match anchor's claimed file_size {}",
+            plaintext.len(),
+            anchor.file_size
+        ));
+    }
+    eprintln!(
+        "[v3 CMY] OK: recovered {} bytes (matches anchor)",
+        plaintext.len()
+    );
+    Ok(plaintext)
+}
+
+/// ITU-R BT.601 luma conversion. Same coefficients as the v3 lib's
+/// internal `rgb_to_luma_bitmap`. Replicated here to avoid widening
+/// the v3 lib's public API for one diagnostic helper. Used to
+/// produce a luma view for `detect_geometry` in
+/// [`run_v3_cmy_decode`] — finder patterns sit at composite-black
+/// luma 0 regardless of per-channel ink fade.
+fn rgb_to_luma(rgb: &ampaper::v3::RgbPageBitmap) -> ampaper::v3::PageBitmap {
+    let n = (rgb.width as usize) * (rgb.height as usize);
+    let mut pixels = vec![0u8; n];
+    for (i, p) in pixels.iter_mut().enumerate() {
+        let r = rgb.pixels[i * 3] as u32;
+        let g = rgb.pixels[i * 3 + 1] as u32;
+        let b = rgb.pixels[i * 3 + 2] as u32;
+        *p = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
+    }
+    ampaper::v3::PageBitmap {
+        pixels,
+        width: rgb.width,
+        height: rgb.height,
+    }
+}
+
+/// Where the v3 decode diagnostic dumps land. Co-located with the
+/// gitignored `scratch/` directory so they don't accidentally get
+/// committed. Path is relative to the GUI's working directory,
+/// which under the VS Code build/rebuild task is the workspace
+/// root. Emitting them as PNG keeps file sizes manageable while
+/// preserving exact pixel values (no JPEG quantization).
+const DIAG_DUMP_DIR: &str = "scratch/decode-debug";
+
+/// Compute and log min / p10 / p50 / p90 / max of a luma bitmap,
+/// plus the Otsu threshold the run-length detector will use. Tells
+/// the user at a glance whether composite-black finder pixels
+/// actually came through the scan as low luma — if min and p10 are
+/// both near 0 the finders are intact and any "0 finders detected"
+/// failure is downstream (rotation, cropping, etc.). If min sits
+/// at luma 40+ the scan crushed contrast and even the darkest
+/// pixels aren't recognizable as "black."
+fn log_luma_stats(tag: &str, luma: &[u8]) {
+    if luma.is_empty() {
+        eprintln!("[{tag}] luma stats: empty bitmap");
+        return;
+    }
+    let mut hist = [0u32; 256];
+    for &p in luma {
+        hist[p as usize] += 1;
+    }
+    let total = luma.len() as u64;
+    let percentile = |q: f32| -> u8 {
+        let target = ((total as f32) * q).round() as u64;
+        let mut acc = 0u64;
+        for (v, &c) in hist.iter().enumerate() {
+            acc += c as u64;
+            if acc >= target {
+                return v as u8;
+            }
+        }
+        255
+    };
+    let min = hist.iter().position(|&c| c > 0).unwrap_or(0) as u8;
+    let max = (255 - hist.iter().rev().position(|&c| c > 0).unwrap_or(0)) as u8;
+    let p10 = percentile(0.1);
+    let p50 = percentile(0.5);
+    let p90 = percentile(0.9);
+    let otsu = ampaper::v3::threshold::otsu_threshold(luma);
+    eprintln!(
+        "[{tag}] luma stats: min={min} p10={p10} p50={p50} p90={p90} max={max}, Otsu threshold={otsu}"
+    );
+    if min > 30 {
+        eprintln!(
+            "[{tag}]   ⚠ darkest pixel is luma {min}; composite-black finders should hit luma 0-15. Scan likely had contrast crushed (document mode? brightness offset?)"
+        );
+    }
+    if p90 < 200 {
+        eprintln!(
+            "[{tag}]   ⚠ p90 luma {p90} suggests background isn't reading as white; scan might be tinted or under-exposed"
+        );
+    }
+}
+
+/// Save a grayscale bitmap to `DIAG_DUMP_DIR/<filename>` for
+/// inspection. Failures (missing dir, IO error) are logged but
+/// don't fail the decode — diagnostic dumps are best-effort. The
+/// directory is created if missing.
+fn save_diag_luma(filename: &str, luma: &[u8], width: u32, height: u32) {
+    let dir = std::path::PathBuf::from(DIAG_DUMP_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[diag] couldn't create {DIAG_DUMP_DIR}: {e}");
+        return;
+    }
+    let path = dir.join(filename);
+    match image::save_buffer(
+        &path,
+        luma,
+        width,
+        height,
+        image::ExtendedColorType::L8,
+    ) {
+        Ok(()) => eprintln!("[diag] saved luma view → {}", path.display()),
+        Err(e) => eprintln!("[diag] couldn't save {}: {e}", path.display()),
+    }
+}
+
+/// Save an RGB bitmap (3 bytes/pixel) to `DIAG_DUMP_DIR/<filename>`.
+fn save_diag_rgb(filename: &str, rgb: &[u8], width: u32, height: u32) {
+    let dir = std::path::PathBuf::from(DIAG_DUMP_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[diag] couldn't create {DIAG_DUMP_DIR}: {e}");
+        return;
+    }
+    let path = dir.join(filename);
+    match image::save_buffer(
+        &path,
+        rgb,
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    ) {
+        Ok(()) => eprintln!("[diag] saved RGB view → {}", path.display()),
+        Err(e) => eprintln!("[diag] couldn't save {}: {e}", path.display()),
+    }
 }
 
 /// Run scan_extract over a single page and bucket each resulting

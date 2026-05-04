@@ -98,6 +98,13 @@ pdfium-render = { version = "0.9", default-features = false, features = [
     "pdfium_latest",
 ] }
 
+# RaptorQ + zstd are direct deps so the GUI can instrument the v3
+# decode pipeline stage-by-stage for diagnostic logging (per-channel
+# parse counts, anchor recovery, RaptorQ convergence). The codec lib
+# uses these too; we pin the same versions.
+raptorq = "2"
+zstd = "0.13"
+
 # Convenience for spawning blocking codec jobs onto a worker thread.
 # eframe's `Context::request_repaint_after` lets us drive UI updates
 # from the worker thread without polling.
