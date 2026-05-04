@@ -510,46 +510,96 @@ pub fn detect_geometry(bitmap: &PageBitmap) -> Result<DetectedGeometry, FinderEr
     let v_pixel =
         ((bl.center_x - tl.center_x).powi(2) + (bl.center_y - tl.center_y).powi(2)).sqrt();
 
-    // Convert to dot distances using the measured unit. These
-    // should be integers (page_width_dots - 7) for an axis-
-    // aligned page; for rotated/skewed inputs the fractional
-    // residual goes into the affine transform later.
-    let h_dot = h_pixel / unit_avg;
-    let v_dot = v_pixel / unit_avg;
-    let pw_dots = (h_dot + 7.0).round();
-    let ph_dots = (v_dot + 7.0).round();
-    if pw_dots < 16.0 || ph_dots < 16.0 {
+    // Recover (nx, ny) from h_pixel and v_pixel using the
+    // aspect-ratio constraint:
+    //
+    //     h_pixel / v_pixel = (nx*32 + 9) / (ny*32 + 9)
+    //
+    // The ratio is independent of pixels-per-dot, so it's
+    // immune to the integer-pixel quantization that biases the
+    // run-length unit estimate. For each candidate `ny` in a
+    // wide range, the IDEAL nx is given exactly by the ratio.
+    // The TRUE `(nx, ny)` is the candidate where this `nx_ideal`
+    // is closest to an integer.
+    //
+    // Why iterate `ny` over a wide range rather than searching
+    // ±1 around a seed: at fractional rendered ppd (e.g. 1.5
+    // when a 600-DPI-encoded page is re-rendered at 300 DPI),
+    // each 7-dot finder run can quantize to 10 or 11 pixels,
+    // giving unit estimates of 10/7 ≈ 1.43 or 11/7 ≈ 1.57. With
+    // all three finders quantizing the same direction (which
+    // happens when the image origin lands on a particular
+    // sub-pixel phase), the unit_avg is biased by up to ~5%.
+    // For a true `nx=52`, the seeded estimate then shifts to
+    // 50, two cells away — wider than a ±1 search can recover.
+    // Caught when warandpeaceguifix.pdf failed auto-decode even
+    // after the original ±1 fix; re-encoding with a different
+    // header config shifted the image origin and exposed the
+    // wider-bias regime.
+    //
+    // Disambiguation: integer-closeness of nx_ideal is the
+    // primary signal. Drift-from-unit_avg is a tiebreaker for
+    // square pages (where every (n, n) candidate has nx_ideal
+    // exactly integer regardless of `n`), where the unit
+    // estimate's bias is small enough to give a reliable hint.
+    let r_aspect = h_pixel / v_pixel;
+    let ny_seed_f = (v_pixel / unit_avg - 9.0) / 32.0;
+    if !(ny_seed_f.is_finite()) || ny_seed_f < 1.0 {
         return Err(FinderError::ProportionMismatch {
-            actual: pw_dots / ph_dots,
+            actual: ny_seed_f,
             expected: 1.0,
         });
     }
+    // Search ny from half to double the seed — covers up to
+    // ±100% bias in the unit estimate, which more than covers
+    // the worst case (≈14% at ppd=0.5).
+    let ny_min = (ny_seed_f * 0.5).max(1.0).floor() as i64;
+    let ny_max = (ny_seed_f * 2.0).ceil() as i64;
 
-    // Recover nx, ny from page_dots = nx * 32 + 16. Round and
-    // sanity-check that the residual is small — large residual
-    // means the bitmap doesn't match a v3 page layout.
-    let nx_f = (pw_dots - 16.0) / 32.0;
-    let ny_f = (ph_dots - 16.0) / 32.0;
-    let nx = nx_f.round() as i64;
-    let ny = ny_f.round() as i64;
-    if nx < 1 || ny < 1 {
-        return Err(FinderError::ProportionMismatch {
-            actual: nx_f.min(ny_f),
-            expected: 1.0,
-        });
+    let mut best_nx: i64 = 0;
+    let mut best_ny: i64 = 0;
+    let mut best_cost = f32::INFINITY;
+    let mut best_dev = f32::INFINITY;
+    for ny_cand in ny_min..=ny_max {
+        let nx_ideal = (r_aspect * ((ny_cand as f32) * 32.0 + 9.0) - 9.0) / 32.0;
+        let nx_cand = nx_ideal.round() as i64;
+        if nx_cand < 1 {
+            continue;
+        }
+        let dev = (nx_ideal - nx_cand as f32).abs();
+        // Reject candidates whose ideal nx is far from integer —
+        // those don't satisfy the aspect-ratio constraint and
+        // can't be the true (nx, ny). 0.2 is generous; valid
+        // candidates land within ~0.05 in practice.
+        if dev > 0.2 {
+            continue;
+        }
+        let ppd_h = h_pixel / ((nx_cand as f32) * 32.0 + 9.0);
+        let drift = (ppd_h - unit_avg).abs() / unit_avg;
+        let cost = dev + 0.001 * drift;
+        if cost < best_cost {
+            best_cost = cost;
+            best_dev = dev;
+            best_nx = nx_cand;
+            best_ny = ny_cand;
+        }
     }
-    if (nx_f - nx as f32).abs() > 0.3 || (ny_f - ny as f32).abs() > 0.3 {
+    if best_nx < 1 || best_ny < 1 {
         return Err(FinderError::ProportionMismatch {
-            actual: (nx_f - nx as f32).abs().max((ny_f - ny as f32).abs()),
+            actual: best_dev,
             expected: 0.0,
         });
     }
+    let nx = best_nx;
+    let ny = best_ny;
 
-    // pixels_per_dot — round to nearest integer ≥ 1. The renderer
-    // only emits integer scales; fractional values come from
-    // print-then-scan resampling and the affine transform handles
-    // them at sample time.
-    let pixels_per_dot = unit_avg.round().max(1.0) as u32;
+    // ppd from the chosen (nx, ny). Average of the two axis
+    // measurements is more accurate than the run-length unit_avg
+    // (which suffered the quantization bias above).
+    let ppd_h = h_pixel / ((nx as f32) * 32.0 + 9.0);
+    let ppd_v = v_pixel / ((ny as f32) * 32.0 + 9.0);
+    let ppd_avg = (ppd_h + ppd_v) * 0.5;
+    let pixels_per_dot = ppd_avg.round().max(1.0) as u32;
 
     Ok(DetectedGeometry {
         nx: nx as u32,

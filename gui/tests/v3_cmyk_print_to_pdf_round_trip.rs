@@ -23,7 +23,9 @@
 
 use std::path::PathBuf;
 
-use ampaper::v3::{PageGeometry, RgbPageBitmap, decode_pages_cmyk, encode_pages_cmyk};
+use ampaper::v3::{
+    PageGeometry, RgbPageBitmap, decode_pages_cmyk, decode_pages_cmyk_auto, encode_pages_cmyk,
+};
 
 #[path = "../src/print.rs"]
 mod print;
@@ -44,13 +46,16 @@ fn gui_cmy_geometry() -> PageGeometry {
 #[test]
 fn cmy_encode_save_pdf_render_decode_round_trips_bytes() {
     let geom = gui_cmy_geometry();
-    // 8 KB pseudo-random — stays incompressible (so zstd skips
-    // and the test exercises the raw-bytes-through-RaptorQ path),
-    // but small enough that the PDF render at 600 DPI doesn't
-    // exhaust test memory.
-    let mut payload = Vec::with_capacity(8192);
+    // ~700 KB pseudo-random — incompressible (so zstd skips and
+    // the test exercises the raw-bytes-through-RaptorQ path) AND
+    // large enough that the round-robin packet distribution fills
+    // most of the page with colored cells. An earlier 8 KB payload
+    // produced K=70 packets in 10605 cell slots → mostly-white
+    // page → the post-render `has_color` sniff would route the
+    // PDF to the v3 B&W decoder, defeating the point of this test.
+    let mut payload = Vec::with_capacity(700_000);
     let mut x: u32 = 0xCAFE_F00D;
-    for _ in 0..8192 {
+    for _ in 0..700_000 {
         x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
         payload.push((x >> 16) as u8);
     }
@@ -123,4 +128,59 @@ fn cmy_encode_save_pdf_render_decode_round_trips_bytes() {
     let recovered = decode_pages_cmyk(&cmy_input, &geom)
         .expect("CMY decode should recover bytes from rendered PDF");
     assert_eq!(recovered, payload, "CMY PDF round-trip must be byte-exact");
+}
+
+#[test]
+fn cmy_pdf_round_trip_auto_decodes_at_decode_tab_render_dpi() {
+    // The Decode tab renders dropped PDFs at DEFAULT_PDF_RENDER_DPI
+    // = 300 (worker.rs), and dispatches to decode_pages_cmyk_auto
+    // (the geometry-self-detecting variant) so the user can drop
+    // a v3 CMY PDF without telling the decoder which Density was
+    // used at encode time. Pin this end-to-end path: encode at
+    // the GUI's default geometry, save at print_dpi=600, render
+    // back at 300, auto-decode.
+    //
+    // Caught when warandpeacecyanfix.pdf failed in the GUI with
+    // "no valid anchor cell" even though the PDF was un-scanned —
+    // the auto-detect's `nx`/`ny` rounding hit a bias from
+    // integer-pixel quantization at fractional ppd (1.5 after the
+    // 600→300 DPI half-downsample) and rounded both up by 1.
+    let geom = gui_cmy_geometry();
+    let mut payload = Vec::with_capacity(700_000);
+    let mut x: u32 = 0xBAD_F00D;
+    for _ in 0..700_000 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        payload.push((x >> 16) as u8);
+    }
+
+    let rgb_pages = encode_pages_cmyk(&payload, &geom, 25)
+        .expect("CMY encode should succeed");
+
+    let tmp = std::env::temp_dir().join("ampaper-gui-v3-cmy-pdf-auto-rt");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let pdf_path: PathBuf = tmp.join("v3-cmy-auto.pdf");
+    save_rgb_pages_as_pdf(&rgb_pages, 600, None, "v3-cmy-auto-test", &pdf_path)
+        .expect("save_rgb_pages_as_pdf should succeed");
+
+    let rendered = match render_pdf_pages(&pdf_path, 300) {
+        Ok(p) => p,
+        Err(e) if e.contains("PDFium library not found") => {
+            eprintln!("skipping CMY PDF auto round-trip — pdfium not installed");
+            return;
+        }
+        Err(e) => panic!("PDF render failed: {e}"),
+    };
+
+    let cmy_input: Vec<RgbPageBitmap> = rendered
+        .into_iter()
+        .map(|p| RgbPageBitmap {
+            pixels: p.rgb,
+            width: p.width,
+            height: p.height,
+        })
+        .collect();
+    let recovered = decode_pages_cmyk_auto(&cmy_input)
+        .expect("CMY auto-decode should recover bytes from PDF rendered at 300 DPI");
+    assert_eq!(recovered, payload, "CMY PDF auto round-trip must be byte-exact");
 }

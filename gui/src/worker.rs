@@ -287,17 +287,60 @@ fn run_decode(req: &DecodeRequest, send: &impl Fn(DecodeMessage)) -> Result<Vec<
     // Legacy classification is skipped for v3 pages (it'd show
     // all-red because v3 cells aren't PB-1.10 cells); a v3-
     // specific cell classification is a future polish item.
-    if has_color(&req.pages[0]) {
+    //
+    // For v3 inputs that came from a PDF: re-render the source at
+    // V3_PDF_RENDER_DPI (600) before decoding. The default 300-DPI
+    // pdf-to-bitmap render leaves the v3 codec sampling on
+    // fractional pixel boundaries (ppd=1.5 when encoder_ppd=3 and
+    // print_dpi=600 — the GUI's defaults), which is too phase-
+    // sensitive: small image-origin offsets within the bitmap (eg
+    // an extra header band shifting where the data area starts)
+    // shift sampled pixels by a half-dot and corrupt enough cells
+    // that RaptorQ can't converge on dense pages. 600 DPI render
+    // gives integer pixels-per-dot for the GUI's encode defaults
+    // and decodes cleanly regardless of phase. We keep 300 DPI as
+    // the default first render because it's lighter weight and
+    // works for the legacy scan_decode path's calibration range
+    // (FORMAT-V1.md §5: scan_decode tuned for ~3 px/dot at 300
+    // DPI render, breaks at higher).
+    let v3_detected = has_color(&req.pages[0]) || sniff_v3(&req.pages[0]);
+    let pages_owned: Vec<DecodePage>;
+    let pages_for_decode: &[DecodePage] = if v3_detected {
+        match rerender_pdf_pages_at(req.pages.as_slice(), V3_PDF_RENDER_DPI) {
+            Ok(p) => {
+                pages_owned = p;
+                send(DecodeMessage::Status(format!(
+                    "Re-rendered PDF input at {V3_PDF_RENDER_DPI} DPI for v3 cell sampling"
+                )));
+                pages_owned.as_slice()
+            }
+            Err(e) => {
+                // Re-render failure (e.g. source is an image, not a
+                // PDF) is fine — fall back to the original render.
+                send(DecodeMessage::Status(format!(
+                    "Using original-DPI bitmap (re-render unavailable: {e})"
+                )));
+                req.pages.as_slice()
+            }
+        }
+    } else {
+        req.pages.as_slice()
+    };
+    let rerendered_req = DecodeRequest {
+        pages: pages_for_decode.to_vec(),
+        password: req.password.clone(),
+    };
+    if has_color(&rerendered_req.pages[0]) {
         send(DecodeMessage::Status(
             "v3 CMY codec detected — decoding via RaptorQ + 3-channel pool".into(),
         ));
-        return run_v3_cmy_decode(req);
+        return run_v3_cmy_decode(&rerendered_req);
     }
-    if sniff_v3(&req.pages[0]) {
+    if sniff_v3(&rerendered_req.pages[0]) {
         send(DecodeMessage::Status(
             "v3 B&W codec detected — decoding via RaptorQ".into(),
         ));
-        return run_v3_decode(req);
+        return run_v3_decode(&rerendered_req);
     }
 
     // Legacy path. First pass: classify each page's cells. We do
@@ -611,6 +654,17 @@ fn has_at_most_two_distinct_bytes(buf: &[u8]) -> bool {
 /// LOWER render DPI for low-density encodes.
 pub const DEFAULT_PDF_RENDER_DPI: u32 = 300;
 
+/// PDF render DPI used after a v3 codec has been detected. 600
+/// matches the Print tab's default `print_dpi`, so the v3 cell
+/// sampler reads on integer pixel boundaries (ppd_eff =
+/// encoder_ppd × render_dpi / print_dpi = 3 × 600/600 = 3 for the
+/// GUI's default encode geometry). At the lower default of 300
+/// DPI, ppd_eff falls to 1.5 and cell sampling becomes phase-
+/// sensitive — a half-dot of image-to-bitmap offset shifts
+/// sampled pixels enough to corrupt cells, and dense pages run
+/// out of RaptorQ recovery margin.
+pub const V3_PDF_RENDER_DPI: u32 = 600;
+
 /// Try to bind to a Pdfium library, looking next to the running
 /// executable first then falling back to system paths. Returns
 /// `Result` instead of panicking the way `Pdfium::default()` does
@@ -657,6 +711,59 @@ pub(crate) fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
 /// pdfium, which is heavy and can fail in non-PDF-specific ways.
 pub fn looks_like_pdf(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-")
+}
+
+/// Re-render any PDF-sourced [`DecodePage`]s at a different DPI,
+/// preserving the order. Image-sourced pages pass through
+/// unchanged (they don't have a re-renderable source — they
+/// already arrived at the user's chosen scan resolution).
+///
+/// Errors when at least one PDF source fails to re-render OR the
+/// re-rendered page count doesn't match the original group from
+/// that source. Both signal a state corruption (file changed on
+/// disk, pdfium binding issue, etc.) that should surface to the
+/// user rather than silently mix bitmaps from different DPIs.
+fn rerender_pdf_pages_at(
+    pages: &[DecodePage],
+    dpi: u32,
+) -> Result<Vec<DecodePage>, String> {
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<DecodePage> = Vec::with_capacity(pages.len());
+    let mut i = 0;
+    while i < pages.len() {
+        let source = pages[i].source.clone();
+        let mut j = i + 1;
+        while j < pages.len() && pages[j].source == source {
+            j += 1;
+        }
+        let group_len = j - i;
+        let mut sniff = [0u8; 8];
+        let n = std::fs::File::open(&source)
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read(&mut sniff)
+            })
+            .unwrap_or(0);
+        let is_pdf = n > 0 && looks_like_pdf(&sniff[..n]);
+        if is_pdf {
+            let rendered = render_pdf_pages(&source, dpi)?;
+            if rendered.len() != group_len {
+                return Err(format!(
+                    "re-render at {dpi} DPI of {} produced {} page(s); expected {}",
+                    source.display(),
+                    rendered.len(),
+                    group_len
+                ));
+            }
+            out.extend(rendered);
+        } else {
+            out.extend_from_slice(&pages[i..j]);
+        }
+        i = j;
+    }
+    Ok(out)
 }
 
 /// Render every page of `pdf_path` to an 8-bit grayscale bitmap at
